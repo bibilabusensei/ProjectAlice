@@ -1,0 +1,127 @@
+name: Build and release iPhone IPA
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'AliceVision.iOS/**'
+      - 'AliceVision.Core/**'
+      - 'AliceVision.Tests/**'
+      - 'scripts/**'
+      - '.github/workflows/ios-ipa.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alice-ios-preview
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  core-tests:
+    name: Test shared camera geometry and algorithms
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Run shared algorithm tests
+        run: dotnet run --project AliceVision.Tests/AliceVision.Tests.csproj --configuration Release
+      - name: Test IPA publication guards
+        run: python3 scripts/test-verify-ipa.py
+
+  build-iphone:
+    name: Build and inspect physical iPhone app
+    needs: core-tests
+    runs-on: macos-15
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Official SDK/workload compatibility:
+      # https://github.com/dotnet/macios/releases/tag/dotnet-10.0.1xx-xcode26.2-10197
+      # Runner Xcode inventory:
+      # https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md
+      - name: Select pinned Xcode 26.2
+        run: |
+          test -d /Applications/Xcode_26.2.app/Contents/Developer
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.103'
+      - name: Pin SDK resolution and install matching iOS workload
+        run: |
+          dotnet new globaljson --sdk-version 10.0.103 --roll-forward disable --force
+          test "$(dotnet --version)" = '10.0.103'
+          dotnet workload install ios --version 10.0.103
+          dotnet workload --info
+      - name: Compile Release device app without signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/build-logs
+          dotnet publish AliceVision.iOS/AliceVision.iOS.csproj \
+            --configuration Release --framework net10.0-ios \
+            --runtime ios-arm64 \
+            -p:EnableCodeSigning=false -p:CodesignRequireProvisioningProfile=false \
+            -p:BuildIpa=false -p:ArchiveOnBuild=false \
+            -p:UseInterpreter=false \
+            -p:ApplicationVersion="${GITHUB_RUN_NUMBER}" \
+            -bl:artifacts/build-logs/ios.binlog \
+            -verbosity:minimal 2>&1 | tee artifacts/build-logs/ios-build.log
+      - name: Package and verify unsigned IPA
+        run: bash scripts/package-ios.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iphone-release-files
+          path: artifacts/ios-release/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve compiler logs for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iphone-build-logs
+          path: artifacts/build-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish-preview:
+    name: Publish tested IPA to GitHub Releases
+    needs: [core-tests, build-iphone]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: iphone-release-files
+          path: artifacts/ios-release/
+      - name: Recheck downloaded IPA before publishing
+        run: |
+          cd artifacts/ios-release
+          sha256sum --check SHA256SUMS.txt
+          cd ../..
+          python3 scripts/verify-ipa.py artifacts/ios-release/AliceVision-iPhone-unsigned.ipa
+      - name: Publish current default-branch commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/publish-ios-release.sh

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Alice Vision</string>
+    <string name="camera_waiting">正在等待相机权限…</string>
+</resources>
