@@ -7,7 +7,6 @@ using CoreGraphics;
 using Foundation;
 using SceneKit;
 using UIKit;
-using nfloat = System.Runtime.InteropServices.NFloat;
 
 namespace AliceVision.iOS;
 
