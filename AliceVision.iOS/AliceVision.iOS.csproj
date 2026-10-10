@@ -5,9 +5,9 @@
     <SupportedOSPlatformVersion>15.0</SupportedOSPlatformVersion>
     <RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
     <ApplicationId>com.projectalice.vision</ApplicationId>
-    <ApplicationTitle>Alice Vision</ApplicationTitle>
-    <ApplicationVersion>1</ApplicationVersion>
-    <ApplicationDisplayVersion>0.0.2</ApplicationDisplayVersion>
+    <ApplicationTitle>Alice·空间伙伴</ApplicationTitle>
+    <ApplicationVersion>2</ApplicationVersion>
+    <ApplicationDisplayVersion>0.1.0</ApplicationDisplayVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -16,4 +16,7 @@
     <CodesignEntitlements></CodesignEntitlements>
     <EnableCodeSigning>false</EnableCodeSigning>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AliceVision.Core\AliceVision.Core.csproj" />
+  </ItemGroup>
 </Project>

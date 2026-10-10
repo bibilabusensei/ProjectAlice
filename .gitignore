@@ -8,6 +8,7 @@
 
 # Scoped publishing clone; never include other workspace projects.
 .projectalice-publish/
+private-models/
 *.ipa
 *.mobileprovision
 *.p12

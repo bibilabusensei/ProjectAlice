@@ -71,6 +71,15 @@ def inspect_ipa(path: pathlib.Path) -> dict[str, object]:
         require('iPhoneOS' in info.get('CFBundleSupportedPlatforms', []), 'Missing iPhoneOS platform')
         require(bool(info.get('NSCameraUsageDescription', '').strip()), 'Camera permission description is missing')
         require(info.get('CFBundleIdentifier') == 'com.projectalice.vision', 'Unexpected bundle identifier')
+        icon = info.get('CFBundleIcons', {}).get('CFBundlePrimaryIcon', {})
+        icon_files = icon.get('CFBundleIconFiles', [])
+        require(bool(icon_files) and all(isinstance(value, str) and value and '/' not in value
+                and '\\' not in value and '..' not in value for value in icon_files),
+                'Missing or unsafe installed app icon declaration')
+        require(root + 'Assets.car' in names, 'Compiled app icon asset catalog is missing')
+        for icon_name in icon_files:
+            require(any(name.startswith(root + icon_name.removesuffix('.png')) and name.endswith('.png')
+                        for name in names), 'Installed app icon PNG is missing')
         orientations = info.get('UISupportedInterfaceOrientations', [])
         required = {'UIInterfaceOrientationPortrait', 'UIInterfaceOrientationLandscapeLeft',
                     'UIInterfaceOrientationLandscapeRight'}
@@ -92,6 +101,8 @@ def inspect_ipa(path: pathlib.Path) -> dict[str, object]:
         'size_bytes': path.stat().st_size,
         'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
         'bundle_identifier': info['CFBundleIdentifier'],
+        'display_name': info.get('CFBundleDisplayName', ''),
+        'app_icon': icon.get('CFBundleIconName', 'AppIcon'),
         'version': info.get('CFBundleShortVersionString', ''),
         'build': info.get('CFBundleVersion', ''),
         'minimum_ios': minimum,

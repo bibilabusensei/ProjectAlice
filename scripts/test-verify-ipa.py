@@ -21,7 +21,7 @@ class PublicationGuardTests(unittest.TestCase):
         self.path = pathlib.Path(self.temp.name) / 'fixture.ipa'
 
     def fixture(self, *, plist_updates=None, cpu=0x0100000C, platform=2, kind=2,
-                executable_mode=0o755, extra_file=None, truncate=False):
+                executable_mode=0o755, extra_file=None, truncate=False, missing_icon=None):
         info = {
             'CFBundlePackageType': 'APPL', 'DTPlatformName': 'iphoneos',
             'CFBundleSupportedPlatforms': ['iPhoneOS'],
@@ -30,6 +30,8 @@ class PublicationGuardTests(unittest.TestCase):
             'CFBundleExecutable': 'AliceVision', 'UIDeviceFamily': [1, 2],
             'MinimumOSVersion': '15.0', 'CFBundleVersion': '1',
             'CFBundleShortVersionString': '0.0.2',
+            'CFBundleIcons': {'CFBundlePrimaryIcon': {
+                'CFBundleIconName': 'AppIcon', 'CFBundleIconFiles': ['AppIcon60x60']}},
             'UISupportedInterfaceOrientations': ['UIInterfaceOrientationPortrait',
                 'UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationLandscapeRight'],
         }
@@ -45,6 +47,10 @@ class PublicationGuardTests(unittest.TestCase):
             entry.create_system = 3
             entry.external_attr = (stat.S_IFREG | executable_mode) << 16
             archive.writestr(entry, binary)
+            if missing_icon != 'catalog':
+                archive.writestr('Payload/AliceVision.app/Assets.car', b'fixture')
+            if missing_icon != 'png':
+                archive.writestr('Payload/AliceVision.app/AppIcon60x60@2x.png', b'fixture')
             if extra_file:
                 archive.writestr(extra_file, b'fixture')
 
@@ -73,6 +79,19 @@ class PublicationGuardTests(unittest.TestCase):
 
     def test_missing_camera_permission_is_rejected(self):
         self.rejected(plist_updates={'NSCameraUsageDescription': ''})
+
+    def test_missing_icon_declaration_is_rejected(self):
+        self.rejected(plist_updates={'CFBundleIcons': {}})
+
+    def test_missing_icon_catalog_is_rejected(self):
+        self.rejected(missing_icon='catalog')
+
+    def test_missing_icon_png_is_rejected(self):
+        self.rejected(missing_icon='png')
+
+    def test_unsafe_icon_name_is_rejected(self):
+        self.rejected(plist_updates={'CFBundleIcons': {'CFBundlePrimaryIcon': {
+            'CFBundleIconFiles': ['../../bad']}}})
 
     def test_missing_landscape_is_rejected(self):
         self.rejected(plist_updates={'UISupportedInterfaceOrientations': ['UIInterfaceOrientationPortrait']})

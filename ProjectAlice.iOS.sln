@@ -8,6 +8,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AliceVision.Core", "AliceVi
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AliceVision.Tests", "AliceVision.Tests\AliceVision.Tests.csproj", "{4A0333C3-5BFD-4C4E-ADF7-A5A27B5E1915}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AliceVision.ModelTests", "AliceVision.ModelTests\AliceVision.ModelTests.csproj", "{3D9392A5-06DD-475A-B890-F90A95777814}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -26,5 +28,9 @@ Global
 		{4A0333C3-5BFD-4C4E-ADF7-A5A27B5E1915}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4A0333C3-5BFD-4C4E-ADF7-A5A27B5E1915}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{4A0333C3-5BFD-4C4E-ADF7-A5A27B5E1915}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3D9392A5-06DD-475A-B890-F90A95777814}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3D9392A5-06DD-475A-B890-F90A95777814}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3D9392A5-06DD-475A-B890-F90A95777814}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3D9392A5-06DD-475A-B890-F90A95777814}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

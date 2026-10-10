@@ -1,14 +1,26 @@
 # Project Alice
 
-## 当前优先：iPhone LiDAR 测试版
+## 当前优先：Alice·空间伙伴 0.1.0（iPhone LiDAR）
 
 现在优先开发 `AliceVision.iOS`：原生 ARKit 后置相机预览、水平面、LiDAR 场景网格与深度、
-真实物体遮挡、点击放置空间标记。目标测试设备为 iPhone 15 Pro。**单摄算法暂不开发，iOS 版不调用下面的边缘估算算法。**
+真实物体遮挡、角色导入与放置、手动动作和选点移动。目标测试设备为 iPhone 15 Pro。
+**AI、Android 和单摄算法暂缓；iOS 版不调用下面的边缘估算算法。**
 
 打开 `ProjectAlice.iOS.sln` 查看 iPhone 项目。GitHub Actions 使用 macOS + Xcode 构建实际
 设备 ARM64 Release IPA，通过包检查后发布 GitHub Release。IPA 未签名，安装前需要你重新签名。
 
-相机画面仅在本机处理。本轮不包含 AI 对话、角色模型、家具语义识别或自主行走。
+新图标和主屏名称已加入原生安装包。内置原创角色“小光”可直接测试挥手、待机和迈步；
+也可从系统“文件”导入 USDZ / DAE / OBJ / GLB / VRM，自动调整到默认 35 cm、脚底贴合平面。
+GLB / VRM 当前仅展示基础材质与初始姿态，不包含骨骼动画、表情和弹簧物理；
+USDZ / DAE 的自带命名动画可手动播放。其他格式和着色器不保证等价还原。
+
+主界面只有“导入角色 / 角色动作 / 更多”。扫描后首次点击放置角色，再点同一平面选目标，
+在动作菜单确认移动。移动限制为已扫描的同一水平面、最多 1.5 米，并保守检查扫描网格；
+这不是完整寻路，也不是可用于现实安全的避障系统。没有行走动画的模型只进行空间平移。
+
+相机画面仅在本机处理，没有网络调用、API 密钥配置或 AI 自主行为。
+第三方角色由用户个人下载后本机导入，受限的阿罗娜模型不在仓库或公开 IPA 中。
+详见 [模型导入与阿罗娜来源](docs/character-models.md)。
 最低系统 iOS 15；当前使用 Xcode 26.2 / .NET 10.0.103。新系统按 API 向后兼容方式运行，
 用户报告的 iOS 27 尚未完成真机验证。
 
@@ -62,6 +74,7 @@ AliceVision/            Windows 控制台冒烟测试入口
 
 ```powershell
 dotnet run --project .\AliceVision.Tests\AliceVision.Tests.csproj --configuration Release
+dotnet run --project .\AliceVision.ModelTests\AliceVision.ModelTests.csproj --configuration Release
 dotnet build .\ProjectAlice.sln --configuration Debug
 ```
 

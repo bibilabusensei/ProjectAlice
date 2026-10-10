@@ -2,15 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleDisplayName</key><string>Alice Vision</string>
+  <key>CFBundleDisplayName</key><string>Alice·空间伙伴</string>
   <key>CFBundleIdentifier</key><string>com.projectalice.vision</string>
-  <key>CFBundleShortVersionString</key><string>0.0.2</string>
-  <key>CFBundleVersion</key><string>1</string>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
   <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>arkit</string></array>
   <key>NSCameraUsageDescription</key>
-  <string>使用后置摄像头检测真实水平面，并在你点击的位置放置空间标记。画面仅在本机处理。</string>
+  <string>使用后置摄像头和 LiDAR 扫描水平面，将你选择的 3D 角色放在真实环境中。相机画面仅在本机处理，不上传。</string>
+  <key>XSAppIconAssets</key><string>Assets.xcassets/AppIcon.appiconset</string>
   <key>UILaunchScreen</key><dict/>
   <key>UIApplicationSceneManifest</key>
   <dict>
