@@ -381,6 +381,7 @@ public sealed partial class VisionViewController : UIViewController
     {
         StopAutonomy("手动控制，AI 已暂停。"); StopMotion();
         if (_characterNode is null) { ShowNotice("先让小伙伴出现", "缓慢扫描地面，点击蓝色区域放置角色。"); return; }
+        CharacterMotion.Play(_asset, _characterNode, "idle");
         var sheet = UIAlertController.Create("角色动作", _asset.DisplayName + " · 手动触发", UIAlertControllerStyle.ActionSheet);
         foreach (string action in _asset.AvailableActions.Where(action => action is not "idle" and not "walk"))
         {
@@ -412,9 +413,11 @@ public sealed partial class VisionViewController : UIViewController
                 PresentViewController(confirm, true, null);
             }));
         }
-        sheet.AddAction(UIAlertAction.Create("停止动作", UIAlertActionStyle.Default, _ =>
+        sheet.AddAction(UIAlertAction.Create("收手回待机", UIAlertActionStyle.Default, _ =>
         {
-            StopMotion(); _placementMessage = "动作已停止。再点地面可选目标。"; RefreshStatus();
+            StopMotion();
+            if (_characterNode is not null) CharacterMotion.Play(_asset, _characterNode, "idle");
+            _placementMessage = "小伙伴正在平滑回到待机。红色急停会立即冻结。"; RefreshStatus();
         }));
         PresentSheet(sheet, _actionButton);
     }
@@ -586,7 +589,9 @@ public sealed partial class VisionViewController : UIViewController
     private void ShowMore()
     {
         StopAutonomy("打开更多控制，AI 已暂停。"); StopMotion();
-        var sheet = UIAlertController.Create("Alice · 空间伙伴", "0.1.0 · 本地 LiDAR 体验", UIAlertControllerStyle.ActionSheet);
+        if (_characterNode is not null) CharacterMotion.Play(_asset, _characterNode, "idle");
+        string version = NSBundle.MainBundle.ObjectForInfoDictionary("CFBundleShortVersionString")?.ToString() ?? "未知版本";
+        var sheet = UIAlertController.Create("Alice · 空间伙伴", version + " · 本地 LiDAR 体验", UIAlertControllerStyle.ActionSheet);
         sheet.AddAction(UIAlertAction.Create("AI 模型与 API 设置", UIAlertActionStyle.Default, _ => OpenAiSettings()));
         sheet.AddAction(UIAlertAction.Create("画活动区域（绿色）", UIAlertActionStyle.Default, _ => BeginZoneEditing(false)));
         sheet.AddAction(UIAlertAction.Create("添加禁止区域（红色）", UIAlertActionStyle.Default, _ => BeginZoneEditing(true)));
@@ -601,7 +606,13 @@ public sealed partial class VisionViewController : UIViewController
         sheet.AddAction(UIAlertAction.Create("角色转身 90°", UIAlertActionStyle.Default, _ =>
         {
             StopMotion();
-            if (_characterNode is not null) _characterNode.EulerAngles += new SCNVector3(0, MathF.PI / 2, 0);
+            if (_characterNode is not null)
+            {
+                var turn = SCNAction.RotateBy(0, MathF.PI / 2, 0, 0.65);
+                turn.TimingMode = SCNActionTimingMode.EaseInEaseOut;
+                _characterNode.RunAction(turn, TurnActionKey);
+                CharacterMotion.Play(_asset, _characterNode, "idle");
+            }
         }));
         sheet.AddAction(UIAlertAction.Create("恢复内置小伙伴", UIAlertActionStyle.Default, _ =>
         {

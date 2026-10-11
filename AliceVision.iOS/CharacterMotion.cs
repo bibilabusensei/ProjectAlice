@@ -54,7 +54,11 @@ public static class CharacterMotion
             Add("leftUpperLeg", CharacterFactory.LeftLeg); Add("rightUpperLeg", CharacterFactory.RightLeg);
         }
         else
-            foreach (string name in RequiredBones.Concat(new[] { "neck", "chest", "upperChest" }))
+            foreach (string name in RequiredBones.Concat(new[] { "neck", "chest", "upperChest" }).Concat(
+                from side in new[] { "left", "right" }
+                from finger in new[] { "Index", "Middle", "Ring", "Little" }
+                from joint in new[] { "Proximal", "Intermediate", "Distal" }
+                select side + finger + joint))
                 Add(name, CharacterGltfImporter.BonePrefix + name);
         States.Add(root, new RigState(body, nodes));
 
@@ -93,59 +97,31 @@ public static class CharacterMotion
 
     private static void ApplyFrame(RigState state, string action, double time, double clock)
     {
-        double duration = Duration(action);
+        double duration = HumanoidGestureMotion.Duration(action);
         if (time >= duration) action = "idle";
-        var idle = HumanoidGestureMotion.SampleIdle(clock);
         var wave = IsWave(action) ? HumanoidGestureMotion.SampleWave(time, action == "greet") : default;
-        float envelope = action is "idle" or "walk" ? 1 : Envelope(time, duration);
         foreach (var pair in state.Bones)
         {
             string name = pair.Key; BonePose pose = pair.Value;
-            Vector3 angles = BasePose(state, name, action, time, envelope, idle, wave);
+            Vector3 angles = BasePose(state, name, action, time, clock, wave);
             pose.Node.Orientation = SCNQuaternion.Normalize(AxisAngle(pose.AxisZ, angles.Z) *
                 AxisAngle(pose.AxisY, angles.Y) * AxisAngle(pose.AxisX, angles.X) * pose.Orientation);
         }
         // Solve in shared model coordinates, then convert absolute orientations
         // through each LIVE parent. Local Z is not the same on different VRMs.
-        ApplyArm(state, state.LeftArm, action, time, envelope, wave);
-        ApplyArm(state, state.RightArm, action, time, envelope, wave);
+        ApplyArm(state, state.LeftArm, action, time);
+        ApplyArm(state, state.RightArm, action, time);
         foreach (var pose in state.Bones.Values) pose.Target = ToNumerics(pose.Node.Orientation);
-        float transition = HumanoidGestureMotion.SmoothStep01(time / 0.50);
+        float transition = HumanoidGestureMotion.SmoothStep01(time / HumanoidGestureMotion.TransitionDuration(action));
         foreach (var pose in state.Bones.Values)
             pose.Node.Orientation = ToScene(Quaternion.Slerp(pose.Start, pose.Target, transition));
     }
 
-    private static Vector3 BasePose(RigState state, string bone, string action, double time, float envelope,
-        IdleMotionSample idle, WaveMotionSample wave)
+    private static Vector3 BasePose(RigState state, string bone, string action, double time, double clock, WaveMotionSample wave)
     {
-        float x = 0, y = 0, z = 0;
-        if (bone == "head") { x = 0.003f * idle.Breathing; y = idle.HeadYaw; z = idle.HeadTilt; }
-        if (bone == "spine") { x = 0.005f * idle.Breathing; z = 0.003f * idle.WeightShift; }
-        float gait = (float)Math.Sin(time * Math.Tau / 1.05);
-        if (action == "walk")
-        {
-            if (bone == "leftUpperLeg") x = 0.20f * gait;
-            if (bone == "rightUpperLeg") x = -0.20f * gait;
-            if (bone == "leftLowerLeg") x = -0.16f * MathF.Max(0, -gait);
-            if (bone == "rightLowerLeg") x = -0.16f * MathF.Max(0, gait);
-        }
-        if (IsWave(action) && bone == "head") { x += wave.HeadNod; z += wave.HeadTilt; }
-        if (action == "nod" && bone == "head") x += 0.14f * Pulse(time, 0.25, 0.85, 1.10, 1.90);
-        if (action == "bow")
-        {
-            float bend = Pulse(time, 0.20, 1.00, 1.30, 2.50);
-            if (bone == "spine") x += 0.22f * bend;
-            if (bone == "head") x += 0.07f * bend;
-        }
-        if (action == "look" && bone == "head") y += 0.20f * Pulse(time, 0.25, 1.00, 1.80, 3.10);
-        if (action == "dance")
-        {
-            float beat = (float)Math.Sin(time * 3.6);
-            if (bone == "spine") z += 0.035f * beat * envelope;
-            if (bone == "head") y += 0.025f * (float)Math.Sin(time * 3.6 - 0.4) * envelope;
-            if (bone == "leftUpperLeg") x = 0.045f * beat * envelope;
-            if (bone == "rightUpperLeg") x = -0.045f * beat * envelope;
-        }
+        Vector3 angles = HumanoidGestureMotion.SampleBoneAngles(bone, action, time, clock);
+        float x = angles.X, y = angles.Y, z = angles.Z;
+        float gait = (float)Math.Sin(time * Math.Tau / 1.25);
         // Capsule arms have no elbows/hands. This modest fallback is only for
         // that built-in rig; imported humanoids use the solver below.
         bool left = bone == "leftUpperArm", right = bone == "rightUpperArm";
@@ -153,61 +129,45 @@ public static class CharacterMotion
         {
             float rest = left ? state.LeftArmRest : state.RightArmRest;
             z = rest;
-            bool waving = left ? action is "wave_left" or "welcome" : action is "wave" or "wave_right" or "greet" or "welcome";
-            if (waving) z += ((left ? state.LeftArmWave : state.RightArmWave) - rest) * wave.Raise + wave.WristSwing * 0.30f;
+            bool waving = left ? action == "wave_left" : action is "wave" or "wave_right" or "greet";
+            if (waving) z += ((left ? state.LeftArmWave : state.RightArmWave) - rest) * wave.Raise
+                + (left ? -1 : 1) * wave.WristSwing * 0.30f;
+            if (action == "welcome") z += (left ? -1 : 1) * 0.35f *
+                HumanoidGestureMotion.GesturePulse(time, 0.18, 1.18, 2.25, 3.75);
             if (action == "walk") x = (left ? -1 : 1) * 0.10f * gait;
         }
         return new Vector3(x, y, z);
     }
 
-    private static void ApplyArm(RigState state, ArmRig? arm, string action, double time, float envelope, WaveMotionSample wave)
+    private static void ApplyArm(RigState state, ArmRig? arm, string action, double time)
     {
         if (arm is null) return;
-        bool waving = arm.IsLeft ? action is "wave_left" or "welcome" : action is "wave" or "wave_right" or "greet" or "welcome";
-        float raise = waving ? wave.Raise : 0;
-        Vector3 shoulder = PositionIn(state.Body, arm.Upper.Node);
-        Vector3 offset = shoulder - arm.Shoulder;
-        Vector3 target = arm.RestTarget + offset;
-        if (action == "walk")
-            target.Z += (arm.IsLeft ? -1 : 1) * 0.14f * arm.TotalLength * (float)Math.Sin(time * Math.Tau / 1.05);
-        if (action == "dance")
-        {
-            target.X += arm.Outward * arm.TotalLength * 0.13f * envelope;
-            target.Z += (arm.IsLeft ? 1 : -1) * arm.TotalLength * 0.06f * (float)Math.Sin(time * 3.6 - 0.3) * envelope;
-        }
-        SolvedArm rest = TwoBoneArmPose.Solve(shoulder, arm.Elbow + offset, arm.Wrist + offset, target, arm.ElbowHint + offset);
-        Quaternion upperSwing = rest.UpperSwing, lowerSwing = rest.LowerSwing;
-        if (waving)
-        {
-            Vector3 raisedTarget = arm.RaisedTarget + offset;
-            raisedTarget.X += arm.Outward * arm.LowerLength * wave.ForearmSwing;
-            SolvedArm lifted = TwoBoneArmPose.Solve(shoulder, arm.Elbow + offset, arm.Wrist + offset, raisedTarget, arm.ElbowHint + offset);
-            // A straight wrist path crosses the elbow hint's direction on some
-            // rigs and flips the bend plane. Blend solved rotations instead;
-            // joint translations/lengths stay intact throughout the lift.
-            var swings = TwoBoneArmPose.BlendSwings(rest, lifted, raise);
-            upperSwing = swings.Upper; lowerSwing = swings.Lower;
-        }
+        bool waving = arm.IsLeft ? action == "wave_left" : action is "wave" or "wave_right" or "greet";
+        ArmMotionPose pose = waving ? HumanoidArmMotion.SampleWaveArm(arm.MotionRig, time)
+            : HumanoidArmMotion.Sample(arm.MotionRig, IsWave(action) ? "idle" : action, time);
         Quaternion body = ToNumerics(state.Body.WorldOrientation);
-        arm.Upper.Node.WorldOrientation = ToScene(body * upperSwing * arm.Upper.InBody);
-        arm.Lower.Node.WorldOrientation = ToScene(body * lowerSwing * arm.Lower.InBody);
-        Quaternion relaxedHand = Quaternion.Normalize(rest.LowerSwing * arm.Hand.InBody);
-        Quaternion liftedHand = Quaternion.Normalize(arm.PalmAlignment * arm.Hand.InBody);
-        if (waving) liftedHand = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, wave.WristSwing) * liftedHand;
-        arm.Hand.Node.WorldOrientation = ToScene(body * Quaternion.Slerp(relaxedHand, liftedHand, raise));
+        arm.Upper.Node.WorldOrientation = ToScene(body * pose.UpperSwing * arm.Upper.InBody);
+        arm.Lower.Node.WorldOrientation = ToScene(body * pose.LowerSwing * arm.Lower.InBody);
+        arm.Hand.Node.WorldOrientation = ToScene(body * pose.HandInBody);
+        foreach (var pair in state.Bones)
+        {
+            string prefix = arm.IsLeft ? "left" : "right";
+            if (!pair.Key.StartsWith(prefix, StringComparison.Ordinal) ||
+                !(pair.Key.Contains("Index", StringComparison.Ordinal) || pair.Key.Contains("Middle", StringComparison.Ordinal) ||
+                  pair.Key.Contains("Ring", StringComparison.Ordinal) || pair.Key.Contains("Little", StringComparison.Ordinal))) continue;
+            float amount = pair.Key.EndsWith("Proximal", StringComparison.Ordinal) ? 1 :
+                pair.Key.EndsWith("Intermediate", StringComparison.Ordinal) ? 0.65f : 0.35f;
+            // Finger flex axes must travel WITH the palm, not stay fixed in
+            // body space when the hand turns to face the viewer.
+            Vector3 curl = Vector3.Transform(arm.CurlAxis, pose.HandInBody * Quaternion.Inverse(arm.Hand.InBody));
+            SCNVector3 axis = pair.Value.Node.ParentNode?.ConvertVectorFromNode(
+                new SCNVector3(curl.X, curl.Y, curl.Z), state.Body) ?? new SCNVector3(1, 0, 0);
+            if (axis.Length > 0.000001f)
+                pair.Value.Node.Orientation = SCNQuaternion.Normalize(AxisAngle(axis / axis.Length, pose.FingerCurl * amount) * pair.Value.Orientation);
+        }
     }
 
-    private static bool IsWave(string action) => action is "wave" or "wave_left" or "wave_right" or "greet" or "welcome";
-    private static double Duration(string action) => action switch
-    {
-        "idle" or "walk" => double.PositiveInfinity, "dance" => 4.5, "bow" => 2.8,
-        "nod" => 2.2, "look" => 3.4, _ => HumanoidGestureMotion.WaveDurationSeconds
-    };
-    private static float Envelope(double time, double duration) =>
-        HumanoidGestureMotion.SmoothStep01(time / 0.5) * HumanoidGestureMotion.SmoothStep01((duration - time) / 0.6);
-    private static float Pulse(double time, double start, double up, double hold, double end) =>
-        time <= start || time >= end ? 0 : time < up ? HumanoidGestureMotion.SmoothStep01((time - start) / (up - start)) :
-        time <= hold ? 1 : 1 - HumanoidGestureMotion.SmoothStep01((time - hold) / (end - hold));
+    private static bool IsWave(string action) => action is "wave" or "wave_left" or "wave_right" or "greet";
     private static SCNQuaternion AxisAngle(SCNVector3 axis, float angle)
     {
         float sine = MathF.Sin(angle * 0.5f);
@@ -322,9 +282,9 @@ public static class CharacterMotion
     {
         internal readonly BonePose Upper, Lower, Hand;
         internal readonly bool IsLeft;
-        internal readonly Vector3 Shoulder, Elbow, Wrist, RestTarget, RaisedTarget, ElbowHint;
+        internal readonly Vector3 Shoulder, Elbow, Wrist, CurlAxis;
         internal readonly float Outward, LowerLength, TotalLength;
-        internal readonly Quaternion PalmAlignment;
+        internal readonly ArmMotionRig MotionRig;
         internal ArmRig(SCNNode body, string side, BonePose upper, BonePose lower, BonePose hand, SCNNode? head, SCNNode? hips)
         {
             Upper = upper; Lower = lower; Hand = hand; IsLeft = side == "left";
@@ -335,11 +295,7 @@ public static class CharacterMotion
             float center = hips is null ? 0 : PositionIn(body, hips).X;
             float lateral = Shoulder.X - center;
             Outward = MathF.Abs(lateral) > TotalLength * 0.0001f ? MathF.Sign(lateral) : IsLeft ? 1 : -1;
-            RestTarget = Shoulder + Vector3.Normalize(new Vector3(Outward * 0.15f, -0.98f, 0.10f)) * TotalLength * 0.985f;
             float headHeight = head is null ? LowerLength * 0.7f : PositionIn(body, head).Y - Shoulder.Y;
-            RaisedTarget = Shoulder + new Vector3(Outward * upperLength * 0.62f,
-                Math.Clamp(headHeight + LowerLength * 0.25f, LowerLength * 0.6f, LowerLength * 1.1f), upperLength * 0.30f);
-            ElbowHint = Shoulder + new Vector3(Outward * upperLength * 0.8f, -upperLength * 0.65f, upperLength * 0.20f);
             var middle = body.FindChildNode(CharacterGltfImporter.BonePrefix + side + "MiddleProximal", true);
             var index = body.FindChildNode(CharacterGltfImporter.BonePrefix + side + "IndexProximal", true);
             var little = body.FindChildNode(CharacterGltfImporter.BonePrefix + side + "LittleProximal", true);
@@ -348,7 +304,9 @@ public static class CharacterMotion
             Vector3 normal = index is not null && little is not null
                 ? Vector3.Cross(longitudinal, PositionIn(body, index) - PositionIn(body, little)) * Outward
                 : -Vector3.UnitY;
-            PalmAlignment = TwoBoneArmPose.AlignBasis(longitudinal, normal, Vector3.UnitY, Vector3.UnitZ);
+            MotionRig = new(Shoulder, Elbow, Wrist, Outward, headHeight, longitudinal, normal, hand.InBody);
+            Vector3 curl = Vector3.Cross(longitudinal, normal);
+            CurlAxis = curl.LengthSquared() > 1e-12f ? Vector3.Normalize(curl) : Vector3.UnitZ;
         }
     }
 

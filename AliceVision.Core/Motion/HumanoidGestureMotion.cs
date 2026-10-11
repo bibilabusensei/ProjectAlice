@@ -47,7 +47,9 @@ public static class HumanoidGestureMotion
             WristWaveStartsAtSeconds + 0.35, WristWaveEndsAtSeconds - 0.35, WristWaveEndsAtSeconds);
         double phase = 5 * Math.PI * Math.Clamp(waveTime / waveSpan, 0, 1);
         float wrist = 0.19f * envelope * (float)Math.Sin(phase);
-        float forearm = 0.045f * envelope * (float)Math.Sin(phase - 0.18);
+        // The first forearm pass must also be outward. A negative phase lag
+        // previously moved the wrist inward just as a greeting began.
+        float forearm = 0.030f * envelope * (float)Math.Sin(phase);
 
         // The head acknowledges once; a repeated sine would look like a bobblehead.
         float nod = includeGreetingNod ? 0.05f * Pulse(elapsedSeconds, 0.75, 1.08, 1.13, 1.62) : 0;
@@ -76,6 +78,82 @@ public static class HumanoidGestureMotion
         RequireFinite(progress, nameof(progress));
         double x = Math.Clamp(progress, 0, 1);
         return (float)(x * x * x * (x * (x * 6 - 15) + 10));
+    }
+
+    public static double Duration(string action) => action switch
+    {
+        "idle" or "walk" => double.PositiveInfinity, "dance" => 4.5,
+        "bow" => 2.8, "nod" => 2.2, "look" => 3.4, "welcome" => 4.2, _ => WaveDurationSeconds
+    };
+
+    public static double TransitionDuration(string action) => action == "idle" ? 0.85 : 0.65;
+
+    public static float ActivityEnvelope(double time, double duration) =>
+        SmoothStep01(time / 0.65) * SmoothStep01((duration - time) / 0.75);
+
+    public static float GesturePulse(double time, double start, double up, double hold, double end) =>
+        Pulse(time, start, up, hold, end);
+
+    /// <summary>Production head/torso/leg deltas, also used by the local preview.</summary>
+    public static System.Numerics.Vector3 SampleBoneAngles(string bone, string action, double time, double clock)
+    {
+        if (!double.IsFinite(time)) throw new ArgumentOutOfRangeException(nameof(time));
+        if (time >= Duration(action)) action = "idle";
+        var idle = SampleIdle(clock);
+        float x = 0, y = 0, z = 0;
+        if (bone == "head") { x = 0.003f * idle.Breathing; y = idle.HeadYaw; z = idle.HeadTilt; }
+        if (bone == "spine") { x = 0.005f * idle.Breathing; z = 0.003f * idle.WeightShift; }
+        float gait = (float)Math.Sin(time * Math.Tau / 1.25);
+        if (action == "walk")
+        {
+            // With +Z forward, negative X swings a down-pointing thigh
+            // forward; positive X bends the knee backwards, never forwards.
+            if (bone == "leftUpperLeg") x = -0.16f * gait;
+            if (bone == "rightUpperLeg") x = 0.16f * gait;
+            if (bone == "leftLowerLeg") x = 0.19f * MathF.Max(0, gait);
+            if (bone == "rightLowerLeg") x = 0.19f * MathF.Max(0, -gait);
+            if (bone == "leftFoot") x = 0.16f * gait - 0.19f * MathF.Max(0, gait);
+            if (bone == "rightFoot") x = -0.16f * gait - 0.19f * MathF.Max(0, -gait);
+        }
+        if (action is "wave" or "wave_left" or "wave_right" or "greet")
+        {
+            var wave = SampleWave(time, action == "greet");
+            float side = action == "wave_left" ? 1 : -1;
+            if (bone == "head") { x += wave.HeadNod; z += side * 0.018f * wave.Raise; y += side * 0.035f * wave.Raise; }
+            if (bone == "spine")
+            {
+                z -= side * 0.012f * wave.Raise; y += side * 0.020f * wave.Raise;
+                x -= 0.007f * wave.Anticipation;
+            }
+        }
+        if (action == "welcome")
+        {
+            float open = Pulse(time, 0.18, 1.18, 2.25, 3.75);
+            if (bone == "spine") x -= 0.015f * open;
+            if (bone == "head") x += 0.045f * Pulse(time, 0.90, 1.30, 1.40, 2.10);
+        }
+        if (action == "nod")
+        {
+            if (bone == "head") x += 0.13f * Pulse(time, 0.25, 0.80, 0.95, 1.85);
+            if (bone == "neck") x += 0.025f * Pulse(time, 0.30, 0.85, 1.00, 1.90);
+        }
+        if (action == "bow")
+        {
+            float bend = Pulse(time, 0.20, 1.00, 1.30, 2.50);
+            if (bone == "spine") x += 0.12f * bend;
+            if (bone == "chest") x += 0.045f * bend;
+            if (bone == "head") x += 0.045f * Pulse(time, 0.30, 1.08, 1.35, 2.55);
+        }
+        if (action == "look" && bone == "head")
+            y += 0.18f * Pulse(time, 0.25, 0.85, 1.10, 1.65) - 0.13f * Pulse(time, 1.55, 2.20, 2.40, 3.20);
+        if (action == "dance")
+        {
+            float envelope = ActivityEnvelope(time, 4.5), beat = (float)Math.Sin(time * 2.4);
+            if (bone == "spine") z += 0.020f * beat * envelope;
+            if (bone == "head") y += 0.018f * (float)Math.Sin(time * 2.4 - 0.4) * envelope;
+            // No independent leg pistons while the feet are supposed to be planted.
+        }
+        return new(x, y, z);
     }
 
     private static float Pulse(double time, double start, double peakStart, double peakEnd, double end)

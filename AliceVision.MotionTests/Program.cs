@@ -22,7 +22,7 @@ var tests = new (string Name, Action Run)[]
 };
 
 int failures = 0, count = 0;
-foreach (var test in tests.Concat(ArmPoseTests.Cases))
+foreach (var test in tests.Concat(ArmPoseTests.Cases).Concat(GesturePoseTests.Cases))
 {
     count++;
     try { test.Run(); Console.WriteLine("PASS " + test.Name); }

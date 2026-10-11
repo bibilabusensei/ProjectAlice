@@ -305,7 +305,7 @@ public sealed partial class VisionViewController
     private static string ActionLabel(string action) => action switch
     {
         "idle" => "待机", "wave" or "wave_right" => "右手挥手", "wave_left" => "左手挥手", "greet" => "招呼",
-        "welcome" => "双手欢迎", "nod" => "点头", "bow" => "鞠躬", "dance" => "舞动",
+        "welcome" => "张手欢迎", "nod" => "点头", "bow" => "鞠躬", "dance" => "轻轻晃动",
         "look_at_user" => "看向你", "look" => "环顾", "move_to_target" => "移动到活动区目标", _ => action
     };
 }

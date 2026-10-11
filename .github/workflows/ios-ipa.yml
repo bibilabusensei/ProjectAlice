@@ -45,6 +45,8 @@ jobs:
         run: dotnet run --project AliceVision.AgentTests/AliceVision.AgentTests.csproj --configuration Release
       - name: Run humanoid motion timing and two-bone pose tests
         run: dotnet run --project AliceVision.MotionTests/AliceVision.MotionTests.csproj --configuration Release
+      - name: Compile local production-motion preview tool without user assets
+        run: dotnet build scripts/motion-preview-tool/MotionPreview.csproj --configuration Release
       - name: Test IPA publication guards
         run: python3 scripts/test-verify-ipa.py
       - name: Test lossless material-copy repair guards
