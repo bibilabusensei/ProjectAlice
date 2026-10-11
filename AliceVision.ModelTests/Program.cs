@@ -53,6 +53,15 @@ var tests = new (string Name, Action Body)[]
     ("loads padded interleaved vertices", LoadsStridedVertices),
     ("preserves Y-up TRS and matrix translations", PreservesTransforms),
     ("preserves original bind vertices and native skin data", PreservesSkinData),
+    ("preserves 307-joint and 1024-joint rigs with unsigned short influences", PreservesLargeSkinData),
+    ("rejects oversized or invalid large-rig joints with actionable diagnostics", BoundsLargeSkinData),
+    ("identifies non-array model fields and unchanged image count bounds", DiagnosesArrayBounds),
+    ("estimates large unchanged geometry without arithmetic overflow", EstimatesGeometryMemory),
+    ("bounds geometry estimates and accounts for native skin buffers", BoundsGeometryMemory),
+    ("runs streamed geometry preflight before reading vertex arrays", RunsGeometryPreflight),
+    ("preserves native memory guard rejection type and message", PreservesPreflightRejection),
+    ("supports cancellation before streamed geometry allocation", CancelsGeometryPreflight),
+    ("reads only the used inverse bind prefix of oversized accessors", BoundsInverseBindPrefix),
     ("validates legacy and modern VRM humanoid maps", ValidatesHumanBones),
     ("streams large sparse files without whole-file allocation", StreamsLargeFile),
     ("accepts exact 1 GiB boundary with bounded allocation", AcceptsExactFileBoundary),
@@ -151,6 +160,63 @@ static void PreservesSkinData()
         "Native skinning must not receive CPU-baked vertices (double-transform risk).");
     Assert(primitive.Skin!.RestBoundsMinimum.Y == 1 && primitive.Skin.RestBoundsMaximum.Y == 2,
         "Native skin pose normalization must use evaluated rest-world bounds.");
+}
+
+static void PreservesLargeSkinData()
+{
+    // This fixture is authored here, not copied from a user's avatar. Its high
+    // joint indices exercise the real 16-bit path without large mesh allocation.
+    foreach (int jointCount in new[] { 307, 1024 })
+    {
+        var (json, binary) = ManyJointTriangle(jointCount);
+        var result = GltfDocument.Parse(Encode(json, binary));
+        var primitive = result.Nodes[0].Primitives[0];
+        var skin = primitive.Skin ?? throw new InvalidOperationException("Large-rig skin was lost.");
+        Assert(skin.Joints.Length == jointCount && skin.InverseBindMatrices.Length == jointCount,
+            "Large-rig joint list or inverse bind matrices were truncated.");
+        Assert(skin.InverseBindMatrices.All(matrix => matrix == Matrix4x4.Identity),
+            "Large-rig authored inverse bind matrices changed.");
+        Assert(skin.Joints.SequenceEqual(Enumerable.Range(1, jointCount)), "Large-rig joint order changed.");
+        Assert(skin.BoneIndices[0] == 0 && skin.BoneIndices[4] == 256 && skin.BoneIndices[8] == jointCount - 1,
+            "Unsigned short bone indices above 255 were truncated or remapped.");
+        Assert(skin.Weights[0] == 1 && skin.Weights[4] == 1 && skin.Weights[8] == 1,
+            "Large-rig skin weights changed.");
+        Assert(primitive.Positions.SequenceEqual(new float[] { 0, 0, 0, 1, 0, 0, 0, 1, 0 }) &&
+            skin.RestBoundsMinimum == Vector3.Zero && skin.RestBoundsMaximum == new Vector3(1, 1, 0),
+            "Large-rig import changed authored geometry or identity bind pose.");
+    }
+}
+
+static void BoundsLargeSkinData()
+{
+    var (json, binary) = ManyJointTriangle(1025);
+    string message = RejectionMessage(Encode(json, binary));
+    Assert(message.Contains("joints", StringComparison.Ordinal) && message.Contains("1025", StringComparison.Ordinal) &&
+        message.Contains("1024", StringComparison.Ordinal), "Large-rig count error lacks field, actual count or limit.");
+
+    (json, binary) = ManyJointTriangle(307);
+    BinaryPrimitives.WriteUInt16LittleEndian(binary.AsSpan(44 + 2 * 8, 2), 307);
+    Reject(Encode(json, binary));
+
+    (json, binary) = ManyJointTriangle(307);
+    json["skins"]![0]!["joints"]![306] = 1;
+    Reject(Encode(json, binary));
+}
+
+static void DiagnosesArrayBounds()
+{
+    var (json, binary) = ManyJointTriangle(307);
+    json["skins"]![0]!["joints"] = new JsonObject();
+    string message = RejectionMessage(Encode(json, binary));
+    Assert(message.Contains("joints", StringComparison.Ordinal) && message.Contains("Object", StringComparison.Ordinal),
+        "Non-array error should identify the field and actual JSON kind.");
+
+    (json, binary) = TexturedTriangle();
+    var images = json["images"]!.AsArray();
+    for (int i = images.Count; i < 65; i++) images.Add(images[0]!.DeepClone());
+    message = RejectionMessage(Encode(json, binary));
+    Assert(message.Contains("images", StringComparison.Ordinal) && message.Contains("65", StringComparison.Ordinal) &&
+        message.Contains("64", StringComparison.Ordinal), "Image count safety bound was lifted or lost its diagnostic.");
 }
 
 static void ValidatesHumanBones()
@@ -629,6 +695,186 @@ static void RejectsTextureMemoryInputs()
     Assert(maximal > 64L * 1024 * 1024 * 1024 && maximal < long.MaxValue, "Largest validated textures must not overflow memory arithmetic.");
 }
 
+static void EstimatesGeometryMemory()
+{
+    Assert(GltfDocument.MaximumVertices == 2_000_000 && GltfDocument.MaximumTriangles == 4_000_000,
+        "Large-avatar vertex and triangle admission caps are not the supported 2M/4M boundaries.");
+    // Metadata-sized numbers reflect a large avatar, without using its private
+    // file or allocating any of its vertex, triangle or texture data in tests.
+    const long vertices = 1_787_422, triangles = 3_031_584;
+    long data = vertices * 56 + triangles * 12;
+    var estimate = GltfGeometryMemory.Estimate(vertices, triangles, vertices, 100_000, 200_000);
+    Assert(estimate.ManagedBytes == data + GltfGeometryMemory.MetadataReserveBytes &&
+        estimate.NativeCpuBytes == data && estimate.GpuBytes == data,
+        "CPU and GPU copies of original vertex/index/skin data were undercounted.");
+    Assert(estimate.LargestTransientBytes == 100_000 * 64L + 200_000 * 24L + 1024 * 1024,
+        "Largest primitive conversion scratch was omitted.");
+    Assert(estimate.TotalBytes > 400L * 1024 * 1024 && estimate.TotalBytes < long.MaxValue,
+        "Large-avatar estimate should be hundreds of MiB and must not overflow.");
+    var all = GltfGeometryMemory.Estimate(GltfDocument.MaximumVertices, GltfDocument.MaximumTriangles,
+        GltfDocument.MaximumVertices);
+    Assert(all.TotalBytes > estimate.TotalBytes && all.TotalBytes < long.MaxValue,
+        "Maximum supported geometry counts overflowed or silently used a zero-byte scratch allowance.");
+    Assert(GltfGeometryMemory.Estimate(0, 0, 0).TotalBytes == GltfGeometryMemory.MetadataReserveBytes + 1024 * 1024,
+        "Metadata and allocator reserves must remain even for empty geometry.");
+}
+
+static void BoundsGeometryMemory()
+{
+    var invalid = new (long Vertices, long Triangles, long Skin, int MaxVertices, int MaxTriangles)[]
+    {
+        (-1, 0, 0, 0, 0), (0, -1, 0, 0, 0), (1, 1, -1, 0, 0), (1, 1, 2, 0, 0),
+        ((long)GltfDocument.MaximumVertices + 1, 1, 0, 0, 0),
+        (1, (long)GltfDocument.MaximumTriangles + 1, 0, 0, 0),
+        (long.MaxValue, long.MaxValue, long.MaxValue, 0, 0),
+        (1, 1, 0, -1, 0), (1, 1, 0, 2, 0), (1, 1, 0, 0, -1), (1, 1, 0, 0, 2), (0, 1, 0, 0, 0)
+    };
+    foreach (var item in invalid)
+    {
+        bool rejected = false;
+        try { _ = GltfGeometryMemory.Estimate(item.Vertices, item.Triangles, item.Skin, item.MaxVertices, item.MaxTriangles); }
+        catch (InvalidDataException) { rejected = true; }
+        Assert(rejected, "Invalid geometry memory inputs reached arithmetic or allocation.");
+    }
+    var (json, binary) = ManyJointTriangle(307);
+    var primitive = GltfDocument.Parse(Encode(json, binary)).Nodes[0].Primitives[0];
+    var skin = primitive.Skin!;
+    long expected = primitive.Positions.Length * 4L + primitive.Normals!.Length * 4L + primitive.Indices.Length * 4L +
+        skin.Weights.Length * 4L + skin.BoneIndices.Length * 2L + skin.Joints.Length * 128L;
+    Assert(GltfGeometryMemory.NativeCpuBytesFor(primitive) == expected,
+        "Native copy estimate omitted joint indices, weights or inverse bind matrices.");
+    var palettes = GltfGeometryMemory.Estimate(3, 1, 3, skinJointReferences: 307 * 79);
+    var noPalettes = GltfGeometryMemory.Estimate(3, 1, 3);
+    Assert(palettes.ManagedBytes - noPalettes.ManagedBytes == 307 * 79 * 128L &&
+        palettes.NativeCpuBytes - noPalettes.NativeCpuBytes == 307 * 79 * 128L &&
+        palettes.GpuBytes - noPalettes.GpuBytes == 307 * 79 * 64L,
+        "Repeated skeleton palette costs were omitted or counted only once.");
+    foreach (long invalidReferences in new[] { -1L, GltfDocument.MaximumSkinJoints * 2048L + 1, long.MaxValue })
+    {
+        bool rejected = false;
+        try { _ = GltfGeometryMemory.Estimate(3, 1, 3, skinJointReferences: invalidReferences); }
+        catch (InvalidDataException) { rejected = true; }
+        Assert(rejected, "Invalid skeleton reference counts reached arithmetic.");
+    }
+}
+
+static void RunsGeometryPreflight()
+{
+    var (json, binary) = Triangle();
+    BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(0, 4), BitConverter.SingleToInt32Bits(float.NaN));
+    string path = TemporaryModelPath();
+    File.WriteAllBytes(path, Encode(json, binary));
+    try
+    {
+        bool called = false;
+        long allocationBefore = GC.GetAllocatedBytesForCurrentThread();
+        try
+        {
+            _ = GltfDocument.Load(path, estimate =>
+            {
+                called = true;
+                Assert(estimate.ManagedBytes > 0 && estimate.TotalBytes >= estimate.ManagedBytes,
+                    "Preflight received an empty memory estimate.");
+                throw new InvalidDataException("geometry-preflight-test-stop");
+            });
+            throw new InvalidOperationException("A rejected preflight must stop model loading.");
+        }
+        catch (InvalidDataException error)
+        {
+            Assert(error.Message == "geometry-preflight-test-stop", "Vertex bytes were read before the preflight callback.");
+        }
+        Assert(called, "Streamed model load did not invoke the geometry preflight callback.");
+        Assert(GC.GetAllocatedBytesForCurrentThread() - allocationBefore < 2L * 1024 * 1024,
+            "Small-model preflight allocated unbounded buffers.");
+        BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(0, 4), BitConverter.SingleToInt32Bits(0));
+        File.WriteAllBytes(path, Encode(json, binary));
+        GltfGeometryMemory? received = null;
+        var document = GltfDocument.Load(path, estimate => received = estimate);
+        long actualNative = document.Nodes.SelectMany(node => node.Primitives)
+            .Sum(primitive => GltfGeometryMemory.NativeCpuBytesFor(primitive));
+        Assert(received is not null && document.GeometryMemory == received && received.NativeCpuBytes >= actualNative &&
+            received.TotalBytes >= actualNative,
+            "Geometry preflight undercounts native buffers or is not retained on the document.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void PreservesPreflightRejection()
+{
+    var (json, binary) = Triangle();
+    string path = TemporaryModelPath();
+    File.WriteAllBytes(path, Encode(json, binary));
+    try
+    {
+        const string message = "原画质模型内存不足；未修改贴图或减少面数。";
+        bool preserved = false;
+        try
+        {
+            _ = GltfDocument.Load(path, _ => throw new InvalidOperationException(message));
+        }
+        catch (InvalidOperationException error) { preserved = error.Message == message; }
+        Assert(preserved, "Native allocator rejection was converted to a malformed-model JSON error.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void CancelsGeometryPreflight()
+{
+    var (json, binary) = Triangle();
+    BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(0, 4), BitConverter.SingleToInt32Bits(float.NaN));
+    string path = TemporaryModelPath();
+    File.WriteAllBytes(path, Encode(json, binary));
+    try
+    {
+        using var beforeLoad = new CancellationTokenSource();
+        beforeLoad.Cancel();
+        bool callbackCalled = false, cancelled = false;
+        try { _ = GltfDocument.Load(path, _ => callbackCalled = true, beforeLoad.Token); }
+        catch (OperationCanceledException) { cancelled = true; }
+        Assert(cancelled && !callbackCalled, "Pre-cancelled loading reached the allocator callback.");
+
+        using var duringPreflight = new CancellationTokenSource();
+        cancelled = false;
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        try
+        {
+            _ = GltfDocument.Load(path, _ => duringPreflight.Cancel(), duringPreflight.Token);
+        }
+        catch (OperationCanceledException) { cancelled = true; }
+        Assert(cancelled, "Preflight cancellation read invalid vertex bytes instead of stopping.");
+        Assert(GC.GetAllocatedBytesForCurrentThread() - before < 2L * 1024 * 1024,
+            "Cancelled preflight allocated unbounded geometry storage.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void BoundsInverseBindPrefix()
+{
+    var (json, original) = SkinnedTriangle();
+    byte[] binary = new byte[original.Length + 64];
+    original.CopyTo(binary, 0);
+    BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(original.Length, 4), BitConverter.SingleToInt32Bits(float.NaN));
+    const int unusedMatrixCount = 1_000_000;
+    json["bufferViews"]![4]!["byteLength"] = unusedMatrixCount * 64;
+    json["accessors"]![4]!["count"] = unusedMatrixCount;
+    string path = TemporaryModelPath();
+    try
+    {
+        // A sparse 64 MB accessor gives a useful allocation regression without
+        // keeping its unused data in RAM. NaN immediately after the single used
+        // bind matrix also detects accidental full-accessor validation/reads.
+        WriteSparseGlb(path, json, binary, 104 + unusedMatrixCount * 64);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        var document = GltfDocument.Load(path);
+        var skin = document.Nodes[0].Primitives[0].Skin!;
+        Assert(skin.InverseBindMatrices.Length == 1 && skin.InverseBindMatrices[0] == Matrix4x4.CreateTranslation(0, -2, 0),
+            "Used inverse bind prefix was lost, changed or expanded to the unused accessor tail.");
+        Assert(GC.GetAllocatedBytesForCurrentThread() - before < 8L * 1024 * 1024,
+            "Oversized inverse bind accessor caused a whole-tail allocation.");
+    }
+    finally { File.Delete(path); }
+}
+
 static string TemporaryModelPath() => Path.Combine(Path.GetTempPath(), "AliceVision-texture-test-" + Guid.NewGuid().ToString("N") + ".glb");
 
 static (JsonObject Json, byte[] Binary) Triangle()
@@ -673,6 +919,46 @@ static (JsonObject Json, byte[] Binary) SkinnedTriangle()
     return (json, binary);
 }
 
+static (JsonObject Json, byte[] Binary) ManyJointTriangle(int jointCount)
+{
+    var (json, original) = Triangle();
+    int matrixOffset = 116;
+    byte[] binary = new byte[matrixOffset + jointCount * 64];
+    original.CopyTo(binary, 0);
+    json["buffers"]![0]!["byteLength"] = binary.Length;
+    var views = json["bufferViews"]!.AsArray();
+    views.Add(JsonNode.Parse("{\"buffer\":0,\"byteOffset\":44,\"byteLength\":24}"));
+    views.Add(JsonNode.Parse("{\"buffer\":0,\"byteOffset\":68,\"byteLength\":48}"));
+    views.Add(new JsonObject { ["buffer"] = 0, ["byteOffset"] = matrixOffset, ["byteLength"] = jointCount * 64 });
+    var accessors = json["accessors"]!.AsArray();
+    accessors.Add(JsonNode.Parse("{\"bufferView\":2,\"componentType\":5123,\"count\":3,\"type\":\"VEC4\"}"));
+    accessors.Add(JsonNode.Parse("{\"bufferView\":3,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}"));
+    accessors.Add(new JsonObject { ["bufferView"] = 4, ["componentType"] = 5126, ["count"] = jointCount, ["type"] = "MAT4" });
+    json["meshes"]![0]!["primitives"]![0]!["attributes"]!["JOINTS_0"] = 2;
+    json["meshes"]![0]!["primitives"]![0]!["attributes"]!["WEIGHTS_0"] = 3;
+    var nodes = new JsonArray { new JsonObject { ["mesh"] = 0, ["skin"] = 0 } };
+    var joints = new JsonArray();
+    var roots = new JsonArray { 0 };
+    for (int i = 0; i < jointCount; i++)
+    {
+        nodes.Add(new JsonObject());
+        joints.Add(i + 1);
+        roots.Add(i + 1);
+        Buffer.BlockCopy(new float[] { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }, 0,
+            binary, matrixOffset + i * 64, 64);
+    }
+    json["nodes"] = nodes;
+    json["skins"] = new JsonArray { new JsonObject { ["joints"] = joints, ["inverseBindMatrices"] = 4 } };
+    json["scenes"]![0]!["nodes"] = roots;
+    for (int i = 0; i < 3; i++)
+    {
+        int joint = i switch { 0 => 0, 1 => 256, _ => jointCount - 1 };
+        BinaryPrimitives.WriteUInt16LittleEndian(binary.AsSpan(44 + i * 8, 2), (ushort)joint);
+        Buffer.BlockCopy(new float[] { 1, 0, 0, 0 }, 0, binary, 68 + i * 16, 16);
+    }
+    return (json, binary);
+}
+
 static (JsonObject Json, byte[] Binary) TexturedTriangle()
 {
     var (json, original) = Triangle();
@@ -711,6 +997,12 @@ static void Reject(byte[] bytes)
 {
     try { _ = GltfDocument.Parse(bytes); }
     catch (InvalidDataException) { return; }
+    throw new InvalidOperationException("Malformed model was not rejected safely.");
+}
+static string RejectionMessage(byte[] bytes)
+{
+    try { _ = GltfDocument.Parse(bytes); }
+    catch (InvalidDataException error) { return error.Message; }
     throw new InvalidOperationException("Malformed model was not rejected safely.");
 }
 static void Assert(bool condition, string message)

@@ -27,9 +27,11 @@ internal static class CharacterGltfImporter
         cancellation.ThrowIfCancellationRequested();
         ModelMemoryGuard.EnsureCanAllocate(128L * 1024 * 1024, "解析模型前检查");
         progress?.Invoke("正在解析模型；保留原始贴图分辨率…");
+        GltfDocument ReadGuarded() => GltfDocument.Load(localPath,
+            memory => ModelMemoryGuard.EnsureCanAllocate(memory.TotalBytes, "原网格内存预检查"), cancellation);
         GltfDocument document = yieldBetweenSteps
-            ? await Task.Run(() => GltfDocument.Load(localPath), cancellation)
-            : GltfDocument.Load(localPath);
+            ? await Task.Run(ReadGuarded, cancellation)
+            : ReadGuarded();
         cancellation.ThrowIfCancellationRequested();
         var root = new SCNNode { Name = RigRoot };
         using var content = new SCNNode { Name = "AliceVision.AvatarCoordinates", Transform = ToSceneMatrix(document.AvatarBasis) };
@@ -51,8 +53,12 @@ internal static class CharacterGltfImporter
             var referencedImages = selectedMaterials.Select(index => document.Materials[index]).Where(material => material.Texture >= 0)
                 .Select(material => document.Textures[material.Texture].Image).ToHashSet();
             var activeImages = referencedImages.Select(index => document.Images[index]).ToArray();
-            long remainingBudget = ModelTextureMemory.Estimate(activeImages);
-            ModelMemoryGuard.EnsureCanAllocate(remainingBudget, "原画质贴图预检查");
+            // Managed geometry is now allocated, but native CPU/GPU copies are
+            // still pending. Keep their full cost in the texture admission check.
+            long remainingBudget = checked(ModelTextureMemory.Estimate(activeImages) +
+                document.GeometryMemory.NativeCpuBytes + document.GeometryMemory.GpuBytes +
+                document.GeometryMemory.LargestTransientBytes);
+            ModelMemoryGuard.EnsureCanAllocate(remainingBudget, "原画质贴图与网格预检查");
             int loadedCount = 0;
             for (int imageIndex = 0; imageIndex < document.Images.Count; imageIndex++)
             {
@@ -100,6 +106,10 @@ internal static class CharacterGltfImporter
                 cancellation.ThrowIfCancellationRequested();
                 foreach (GltfPrimitive primitive in source.Primitives)
                 {
+                    cancellation.ThrowIfCancellationRequested();
+                    if (yieldBetweenSteps) await Task.Delay(1, cancellation);
+                    ModelMemoryGuard.EnsureCanAllocate(remainingBudget, "构建原网格与骨骼前检查");
+                    using var pool = new NSAutoreleasePool();
                     using var geometry = CreateGeometry(primitive);
                     geometry.Materials = new[] { primitive.Material < 0 ? defaultMaterial : nativeMaterials[primitive.Material]! };
                     using var mesh = SCNNode.FromGeometry(geometry);
@@ -127,13 +137,15 @@ internal static class CharacterGltfImporter
                         content.AddChildNode(mesh);
                     }
                     else nodes[i].AddChildNode(mesh);
+                    remainingBudget -= GltfGeometryMemory.NativeCpuBytesFor(primitive);
                 }
             }
             for (int i = 0; i < nodes.Length; i++)
                 foreach (int child in document.Nodes[i].Children) nodes[i].AddChildNode(nodes[child]);
             foreach (int index in document.Roots) content.AddChildNode(nodes[index]);
             cancellation.ThrowIfCancellationRequested();
-            ModelMemoryGuard.EnsureCanAllocate(ModelMemoryGuard.PendingTextureUploadBytes(activeImages) + 32L * 1024 * 1024,
+            ModelMemoryGuard.EnsureCanAllocate(checked(ModelMemoryGuard.PendingTextureUploadBytes(activeImages) +
+                document.GeometryMemory.GpuBytes + 32L * 1024 * 1024),
                 "原画质 GPU 上传前检查");
             // SceneKit retains child nodes, geometries, materials and image contents.
             return root;

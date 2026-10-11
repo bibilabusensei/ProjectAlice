@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Numerics;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 
 namespace AliceVision.Core.Models;
@@ -21,9 +22,12 @@ public sealed record GltfMaterial(Vector4 BaseColor, int Texture, float Metallic
 public sealed class GltfDocument
 {
     public const int MaximumFileBytes = 1 << 30;
-    public const int MaximumVertices = 300_000;
-    public const int MaximumTriangles = 500_000;
+    public const int MaximumVertices = 2_000_000;
+    public const int MaximumTriangles = 4_000_000;
     public const int MaximumNodes = 4096;
+    // Complex avatars include hair/clothing auxiliary joints beyond the 256
+    // values an 8-bit JOINTS_0 stream can encode. Our validated path is UInt16.
+    public const int MaximumSkinJoints = 1024;
     public const int MaximumImages = 64;
     public const int MaximumImageEdge = 8192;
     public const long MaximumImagePixels = 64L * 1024 * 1024;
@@ -32,12 +36,13 @@ public sealed class GltfDocument
     private const int MaximumImageHeaderBytes = 1024 * 1024;
     private GltfDocument(GltfNode[] nodes, int[] roots, GltfImage[] images, GltfTexture[] textures,
         GltfMaterial[] materials, bool hasSkin, bool hasMorphs, bool hasAnimations,
-        IReadOnlyDictionary<string, int> humanBones, bool legacyVrm)
+        IReadOnlyDictionary<string, int> humanBones, bool legacyVrm, GltfGeometryMemory geometryMemory)
     {
         Nodes = nodes; Roots = roots; Images = images; Textures = textures; Materials = materials;
         HasSkin = hasSkin; HasMorphs = hasMorphs; HasAnimations = hasAnimations;
         HumanBones = humanBones;
         IsLegacyVrm = legacyVrm;
+        GeometryMemory = geometryMemory;
     }
     public IReadOnlyList<GltfNode> Nodes { get; }
     public IReadOnlyList<int> Roots { get; }
@@ -49,12 +54,17 @@ public sealed class GltfDocument
     public bool HasAnimations { get; }
     public IReadOnlyDictionary<string, int> HumanBones { get; }
     public bool IsLegacyVrm { get; }
+    public GltfGeometryMemory GeometryMemory { get; }
     // VRM0 is -Z forward; VRM1 is +Z forward. Raw mesh/skin data stay untouched.
     public Matrix4x4 AvatarBasis => IsLegacyVrm ? Matrix4x4.CreateRotationY(MathF.PI) : Matrix4x4.Identity;
 
-    public static GltfDocument Load(string path)
+    /// <summary>Checks bounded geometry metadata before allocating mesh arrays. The
+    /// caller may reject admission based on live device memory without changing the model.</summary>
+    public static GltfDocument Load(string path, Action<GltfGeometryMemory>? allocationPreflight = null,
+        CancellationToken cancellation = default)
     {
-        return GltfFileSource.Read(path, ReadDocument);
+        cancellation.ThrowIfCancellationRequested();
+        return GltfFileSource.Read(path, (json, binary) => ReadDocument(json, binary, allocationPreflight, cancellation));
     }
 
     public static GltfDocument Parse(ReadOnlyMemory<byte> bytes)
@@ -88,12 +98,20 @@ public sealed class GltfDocument
         return ReadDocument(json, new GltfMemorySource(binary));
     }
 
-    private static GltfDocument ReadDocument(ReadOnlyMemory<byte> json, GltfBinarySource binary)
+    private static GltfDocument ReadDocument(ReadOnlyMemory<byte> json, GltfBinarySource binary,
+        Action<GltfGeometryMemory>? allocationPreflight = null, CancellationToken cancellation = default)
     {
         try
         {
             using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 64 });
-            return new Reader(document.RootElement, binary).Read();
+            return new Reader(document.RootElement, binary, allocationPreflight, cancellation).Read();
+        }
+        catch (AllocationRejectedException error)
+        {
+            // Device admission failures are not malformed JSON. Preserve the
+            // caller's original exception, including its useful memory diagnosis.
+            ExceptionDispatchInfo.Capture(error.InnerException!).Throw();
+            throw;
         }
         catch (JsonException) { throw Invalid("模型 JSON 损坏或嵌套过深。"); }
         catch (InvalidOperationException) { throw Invalid("模型 JSON 字段类型无效。"); }
@@ -103,11 +121,14 @@ public sealed class GltfDocument
 
     private static uint ReadU32(ReadOnlySpan<byte> bytes, int offset) => BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(offset, 4));
     private static InvalidDataException Invalid(string message) => new(message);
+    private sealed class AllocationRejectedException(Exception inner) : Exception("Geometry admission rejected.", inner);
 
     private sealed class Reader
     {
         private readonly JsonElement _root;
         private readonly GltfBinarySource _binary;
+        private readonly Action<GltfGeometryMemory>? _allocationPreflight;
+        private readonly CancellationToken _cancellation;
         private int _declaredBinaryLength;
         private View[] _views = [];
         private Accessor[] _accessors = [];
@@ -121,7 +142,12 @@ public sealed class GltfDocument
         private sealed record Accessor(int View, int Offset, int Count, int Component, int Components, string Type, bool Normalized);
         private sealed record Skin(int[] Joints, Matrix4x4[] InverseBind, int Skeleton);
 
-        public Reader(JsonElement root, GltfBinarySource binary) { _root = root; _binary = binary; }
+        public Reader(JsonElement root, GltfBinarySource binary, Action<GltfGeometryMemory>? allocationPreflight,
+            CancellationToken cancellation)
+        {
+            _root = root; _binary = binary;
+            _allocationPreflight = allocationPreflight; _cancellation = cancellation;
+        }
 
         public GltfDocument Read()
         {
@@ -149,6 +175,10 @@ public sealed class GltfDocument
             ReadHierarchy();
             _rawMeshes = Array(_root, "meshes", 512);
             _rawSkins = Array(_root, "skins", 128);
+            GltfGeometryMemory geometryMemory = PreflightGeometry();
+            try { _allocationPreflight?.Invoke(geometryMemory); }
+            catch (Exception error) { throw new AllocationRejectedException(error); }
+            _cancellation.ThrowIfCancellationRequested();
             var nodes = new GltfNode[_rawNodes.Length];
             for (int i = 0; i < nodes.Length; i++)
             {
@@ -183,7 +213,50 @@ public sealed class GltfDocument
             var humanBones = ReadHumanBones(visibleNodes);
             bool legacyVrm = _root.TryGetProperty("extensions", out var extensions) && extensions.TryGetProperty("VRM", out _);
             return new GltfDocument(nodes, roots, images, textures, materials, _rawSkins.Length > 0,
-                _hasMorphs, Array(_root, "animations", 256).Length > 0, humanBones, legacyVrm);
+                _hasMorphs, Array(_root, "animations", 256).Length > 0, humanBones, legacyVrm, geometryMemory);
+        }
+
+        private GltfGeometryMemory PreflightGeometry()
+        {
+            long vertices = 0, triangles = 0, skinnedVertices = 0, jointReferences = 0;
+            int primitiveCount = 0, largestVertices = 0, largestTriangles = 0;
+            foreach (var node in _rawNodes)
+            {
+                _cancellation.ThrowIfCancellationRequested();
+                if (!node.TryGetProperty("mesh", out var meshValue)) continue;
+                int meshIndex = Index(meshValue, _rawMeshes.Length);
+                int joints = node.TryGetProperty("skin", out var skinValue)
+                    ? Array(_rawSkins[Index(skinValue, _rawSkins.Length)], "joints", MaximumSkinJoints,
+                        $"skins[{Index(skinValue, _rawSkins.Length)}].joints").Length : 0;
+                foreach (var primitive in Array(_rawMeshes[meshIndex], "primitives", 128))
+                {
+                    if (++primitiveCount > 2048) throw Invalid("模型网格部件超过 2048。");
+                    if (Integer(primitive, "mode", 4) != 4) throw Invalid("仅支持三角形网格。");
+                    var accessor = _accessors[Index(primitive.GetProperty("attributes").GetProperty("POSITION"), _accessors.Length)];
+                    if (accessor.Type != "VEC3" || accessor.Component != 5126)
+                        throw Invalid("模型顶点必须是有限 Float VEC3。");
+                    int indexCount = accessor.Count;
+                    if (primitive.TryGetProperty("indices", out var indicesValue))
+                    {
+                        var indices = _accessors[Index(indicesValue, _accessors.Length)];
+                        if (indices.Type != "SCALAR" || indices.Normalized || indices.Component is not (5121 or 5123 or 5125))
+                            throw Invalid("模型三角形索引格式无效。");
+                        indexCount = indices.Count;
+                    }
+                    if (indexCount % 3 != 0) throw Invalid("三角形网格的索引或顶点数必须是三的倍数。");
+                    vertices = checked(vertices + accessor.Count);
+                    triangles = checked(triangles + indexCount / 3);
+                    if (vertices > MaximumVertices)
+                        throw Invalid($"模型顶点总数 {vertices} 超过安全上限 {MaximumVertices}；未自动减面。");
+                    if (triangles > MaximumTriangles)
+                        throw Invalid($"模型三角形总数 {triangles} 超过安全上限 {MaximumTriangles}；未自动减面。");
+                    if (joints > 0) skinnedVertices = checked(skinnedVertices + accessor.Count);
+                    jointReferences = checked(jointReferences + joints);
+                    largestVertices = Math.Max(largestVertices, accessor.Count);
+                    largestTriangles = Math.Max(largestTriangles, indexCount / 3);
+                }
+            }
+            return GltfGeometryMemory.Estimate(vertices, triangles, skinnedVertices, largestVertices, largestTriangles, jointReferences);
         }
 
         private static void ValidateJson(JsonElement element, ref int remaining)
@@ -311,7 +384,8 @@ public sealed class GltfDocument
         private Skin ReadSkin(int index)
         {
             var skin = _rawSkins[index];
-            int[] joints = Array(skin, "joints", 256).Select(v => Index(v, _rawNodes.Length)).ToArray();
+            int[] joints = Array(skin, "joints", MaximumSkinJoints, $"skins[{index}].joints")
+                .Select(v => Index(v, _rawNodes.Length)).ToArray();
             if (joints.Length == 0 || joints.Distinct().Count() != joints.Length) throw Invalid("模型骨骼列表无效。");
             int skeletonIndex = skin.TryGetProperty("skeleton", out var skeleton) ? Index(skeleton, _rawNodes.Length) : -1;
             Matrix4x4[] inverse = Enumerable.Repeat(Matrix4x4.Identity, joints.Length).ToArray();
@@ -320,7 +394,9 @@ public sealed class GltfDocument
                 int accessor = Index(accessorValue, _accessors.Length);
                 if (_accessors[accessor].Type != "MAT4" || _accessors[accessor].Component != 5126 || _accessors[accessor].Count < joints.Length)
                     throw Invalid("模型骨骼绑定矩阵无效。");
-                float[] values = ReadValues(accessor, 16);
+                // glTF permits an accessor longer than the joint list. Only the
+                // referenced prefix belongs to this skin; never allocate its tail.
+                float[] values = ReadValues(accessor, 16, joints.Length);
                 for (int i = 0; i < joints.Length; i++) inverse[i] = Matrix(values.AsSpan(i * 16, 16));
             }
             return new Skin(joints, inverse, skeletonIndex);
@@ -328,6 +404,7 @@ public sealed class GltfDocument
 
         private GltfPrimitive ReadPrimitive(JsonElement primitive, int nodeIndex, Skin? skin, int materialCount)
         {
+            _cancellation.ThrowIfCancellationRequested();
             if (++_primitiveTotal > 2048) throw Invalid("模型网格部件超过 2048。");
             if (Integer(primitive, "mode", 4) != 4) throw Invalid("仅支持三角形网格。");
             var attributes = primitive.GetProperty("attributes");
@@ -338,7 +415,7 @@ public sealed class GltfDocument
             float[] vertices = ReadValues(positions, 3);
             int vertexCount = vertices.Length / 3;
             _vertexTotal = checked(_vertexTotal + vertexCount);
-            if (_vertexTotal > MaximumVertices) throw Invalid("模型顶点总数超过 300000。");
+            if (_vertexTotal > MaximumVertices) throw Invalid($"模型顶点总数超过 {MaximumVertices}；未自动减面。");
             float[]? normals = ReadAttribute(attributes, "NORMAL", 3, vertexCount, true);
             float[]? texcoords = ReadAttribute(attributes, "TEXCOORD_0", 2, vertexCount, false);
             uint[] indices;
@@ -351,6 +428,7 @@ public sealed class GltfDocument
                 indices = new uint[accessor.Count];
                 for (int i = 0; i < indices.Length; i++)
                 {
+                    if ((i & 4095) == 0) _cancellation.ThrowIfCancellationRequested();
                     indices[i] = ReadUnsigned(accessor, i, 0);
                     if (indices[i] >= vertexCount) throw Invalid("模型三角形索引越界。");
                 }
@@ -361,7 +439,7 @@ public sealed class GltfDocument
                 indices = Enumerable.Range(0, vertexCount).Select(i => (uint)i).ToArray();
             }
             _triangleTotal = checked(_triangleTotal + indices.Length / 3);
-            if (_triangleTotal > MaximumTriangles) throw Invalid("模型三角形总数超过 500000。");
+            if (_triangleTotal > MaximumTriangles) throw Invalid($"模型三角形总数超过 {MaximumTriangles}；未自动减面。");
             // Static preview fallback: shared vertices receive smooth normals when
             // the asset omits NORMAL. This avoids undefined PBR lighting; author
             // supplied normals are preserved verbatim for exact hard edges.
@@ -376,7 +454,7 @@ public sealed class GltfDocument
             return new GltfPrimitive(vertices, normals, texcoords, indices, material, binding);
         }
 
-        private static float[] GeneratePreviewNormals(float[] positions, uint[] indices)
+        private float[] GeneratePreviewNormals(float[] positions, uint[] indices)
         {
             var sums = new Vector3[positions.Length / 3];
             Vector3 Position(uint index)
@@ -386,6 +464,7 @@ public sealed class GltfDocument
             }
             for (int i = 0; i < indices.Length; i += 3)
             {
+                if ((i & 4095) == 0) _cancellation.ThrowIfCancellationRequested();
                 Vector3 a = Position(indices[i]);
                 Vector3 normal = Vector3.Cross(Position(indices[i + 1]) - a, Position(indices[i + 2]) - a);
                 if (!Finite(normal)) throw Invalid("模型坐标过大，无法计算法线。");
@@ -394,6 +473,7 @@ public sealed class GltfDocument
             float[] result = new float[positions.Length];
             for (int i = 0; i < sums.Length; i++)
             {
+                if ((i & 4095) == 0) _cancellation.ThrowIfCancellationRequested();
                 Vector3 normal = sums[i];
                 if (!Finite(normal)) throw Invalid("模型法线累加溢出。");
                 float scale = Math.Max(Math.Abs(normal.X), Math.Max(Math.Abs(normal.Y), Math.Abs(normal.Z)));
@@ -436,6 +516,7 @@ public sealed class GltfDocument
             for (int i = 0; i < matrices.Length; i++) matrices[i] = skin.InverseBind[i] * _world[skin.Joints[i]] * inverseMesh;
             for (int i = 0; i < vertexCount; i++)
             {
+                if ((i & 4095) == 0) _cancellation.ThrowIfCancellationRequested();
                 float total = 0;
                 Matrix4x4 blend = default;
                 for (int j = 0; j < 4; j++)
@@ -515,12 +596,16 @@ public sealed class GltfDocument
             "rightRingProximal", "rightRingIntermediate", "rightRingDistal", "rightLittleProximal", "rightLittleIntermediate", "rightLittleDistal"
         };
 
-        private float[] ReadValues(int index, int components)
+        private float[] ReadValues(int index, int components, int? prefixCount = null)
         {
             var accessor = _accessors[index];
             if (accessor.Components != components) throw Invalid("模型访问器分量数不匹配。");
-            float[] values = new float[checked(accessor.Count * components)];
-            for (int i = 0; i < accessor.Count; i++)
+            int count = prefixCount ?? accessor.Count;
+            if (count < 0 || count > accessor.Count) throw Invalid("模型访问器前缀范围无效。");
+            float[] values = new float[checked(count * components)];
+            for (int i = 0; i < count; i++)
+            {
+                if ((i & 4095) == 0) _cancellation.ThrowIfCancellationRequested();
                 for (int j = 0; j < components; j++)
                 {
                     var bytes = ComponentBytes(accessor, i, j);
@@ -536,6 +621,7 @@ public sealed class GltfDocument
                     if (!float.IsFinite(value)) throw Invalid("模型包含 NaN 或无穷坐标。");
                     values[i * components + j] = value;
                 }
+            }
             return values;
         }
 
@@ -706,10 +792,15 @@ public sealed class GltfDocument
             throw Invalid("模型 JPEG 缺少有效尺寸。");
         }
 
-        private static JsonElement[] Array(JsonElement owner, string key, int maximum)
+        private static JsonElement[] Array(JsonElement owner, string key, int maximum, string? fieldPath = null)
         {
             if (!owner.TryGetProperty(key, out var value)) return [];
-            if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() > maximum) throw Invalid("模型数组大小或类型无效。");
+            string name = fieldPath ?? key;
+            if (value.ValueKind != JsonValueKind.Array)
+                throw Invalid($"模型字段 {name} 应为数组，实际类型为 {value.ValueKind}。请检查导出格式。");
+            int count = value.GetArrayLength();
+            if (count > maximum)
+                throw Invalid($"模型字段 {name} 包含 {count} 项，超过当前安全上限 {maximum}；未修改模型或降低画质。");
             return value.EnumerateArray().ToArray();
         }
         private static int Index(JsonElement value, int count)

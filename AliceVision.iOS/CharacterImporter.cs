@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
+using AliceVision.Core.Models;
 using Foundation;
 using ModelIO;
 using SceneKit;
@@ -183,14 +184,14 @@ public static class CharacterImporter
                 {
                     vertexTotal = checked(vertexTotal + (long)source.VectorCount);
                 }
-                if (vertexTotal > 300_000)
+                if (vertexTotal > GltfDocument.MaximumVertices)
                 {
-                    throw new InvalidDataException("模型超过 30 万顶点，请先在 Blender 中简化。");
+                    throw new InvalidDataException($"模型顶点总数 {vertexTotal} 超过安全上限 {GltfDocument.MaximumVertices}；未自动减面。");
                 }
                 foreach (var element in geometry.GeometryElements)
                     triangleTotal = checked(triangleTotal + (long)element.PrimitiveCount);
-                if (triangleTotal > 500_000)
-                    throw new InvalidDataException("模型超过 50 万面，请先简化网格。");
+                if (triangleTotal > GltfDocument.MaximumTriangles)
+                    throw new InvalidDataException($"模型三角形总数 {triangleTotal} 超过安全上限 {GltfDocument.MaximumTriangles}；未自动减面。");
                 foreach (var material in geometry.Materials)
                 {
                     if (clearShaders)
