@@ -124,7 +124,11 @@ internal static class CharacterGltfImporter
                         using var skinner = SCNSkinner.Create(geometry, binding.Joints.Select(index => nodes[index]).ToArray(),
                             binding.InverseBindMatrices.Select(ToSceneMatrix).ToArray(), weights, indices);
                         skinner.BaseGeometryBindTransform = SCNMatrix4.Identity;
-                        skinner.Skeleton = binding.Skeleton >= 0 ? nodes[binding.Skeleton] : content;
+                        // glTF inverse binds use its original global space. Our
+                        // common content root represents that space; an authored
+                        // skeleton hint (e.g. hips) must not introduce a second
+                        // root-relative transform. Preserve the actual joint tree.
+                        skinner.Skeleton = content;
                         mesh.Skinner = skinner;
                         mesh.Name = "AliceVision.SkinnedMesh";
                         var minimum = new SCNVector3(binding.RestBoundsMinimum.X, binding.RestBoundsMinimum.Y, binding.RestBoundsMinimum.Z);
@@ -189,10 +193,10 @@ internal static class CharacterGltfImporter
                 sources.Add(CreateSource(primitive.Normals, 3, SCNGeometrySourceSemantics.Normal));
             if (primitive.Texcoords is not null)
             {
-                // glTF image UVs start at the top left; SceneKit uses the bottom left.
-                float[] coords = (float[])primitive.Texcoords.Clone();
-                for (int i = 1; i < coords.Length; i += 2) coords[i] = 1 - coords[i];
-                sources.Add(CreateSource(coords, 2, SCNGeometrySourceSemantics.Texcoord));
+                // glTF and SceneKit's iOS UIImage texture path both start at the
+                // top left. A 1-v conversion samples the wrong atlas regions.
+                // Keep authored UVs and image pixels unchanged.
+                sources.Add(CreateSource(primitive.Texcoords, 2, SCNGeometrySourceSemantics.Texcoord));
             }
             byte[] indices = new byte[primitive.Indices.Length * sizeof(uint)];
             Buffer.BlockCopy(primitive.Indices, 0, indices, 0, indices.Length);
@@ -260,11 +264,19 @@ internal static class CharacterGltfImporter
         33071 => SCNWrapMode.Clamp, 33648 => SCNWrapMode.Mirror, _ => SCNWrapMode.Repeat
     };
 
-    // System.Numerics uses row vectors; the fields here are the transposed glTF
-    // column-major matrix, exactly the layout SceneKit's SCNMatrix4 binding uses.
-    private static SCNMatrix4 ToSceneMatrix(Matrix4x4 matrix) => new(
-        matrix.M11, matrix.M12, matrix.M13, matrix.M14,
-        matrix.M21, matrix.M22, matrix.M23, matrix.M24,
-        matrix.M31, matrix.M32, matrix.M33, matrix.M34,
-        matrix.M41, matrix.M42, matrix.M43, matrix.M44);
+    // The modern binding is column-major, but its 16-scalar constructor takes
+    // ROWS. Explicit columns avoid treating Numerics translation as perspective.
+    private static SCNMatrix4 ToSceneMatrix(Matrix4x4 matrix)
+    {
+        GltfSceneTransform columns = GltfSceneTransform.FromNumerics(matrix);
+        return new SCNMatrix4
+        {
+            Column0 = ToSceneVector(columns.Column0),
+            Column1 = ToSceneVector(columns.Column1),
+            Column2 = ToSceneVector(columns.Column2),
+            Column3 = ToSceneVector(columns.Column3)
+        };
+    }
+
+    private static SCNVector4 ToSceneVector(Vector4 vector) => new(vector.X, vector.Y, vector.Z, vector.W);
 }

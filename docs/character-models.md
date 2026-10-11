@@ -17,6 +17,10 @@ Blender 或其他建模软件可导出自包含 GLB / USDZ；具体导出能力�
 VRM0/1 humanBones 用于通用招呼、左右手招手、欢迎、点头、鞠躬、舞动与迈步，不针对某个角色硬编码。
 VRM0 的 -Z 前向与 VRM1 的 +Z 前向在渲染时统一为 +Z，网格和骨骼一起转换，不覆盖原文件；参见 [VRM 官方规范](https://vrm.dev/en/vrm/vrm_features/)。
 普通 GLB 的皮肤可显示，但任意命名的骨骼不保证被识别人形动作；需要通用人形动作时优先导出带标准映射的 VRM。
+从 0.2.3 起，System.Numerics 行向量矩阵显式转换为 SceneKit 原生列向量矩阵，避免平移被写入透视项而拉长网格。
+蒙皮使用共同模型根作为绑定空间，保留原骨骼层级和绑定矩阵；iOS UIImage 贴图直接使用原始 UV，不执行额外 V 翻转。
+矩阵布局依据 [官方 .NET SceneKit 实现](https://github.com/dotnet/macios/blob/main/src/SceneKit/SCNMatrix4_dotnet.cs)；
+UV 行为对照 [glTF 规范](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#images)及 [SceneKit glTF 加载器](https://github.com/magicien/GLTFSceneKit/blob/master/Sources/GLTFSceneKit/GLTFUnarchiver.swift)。
 这是程序化动作，不是动作捕捉、复杂动作生成或完整 IK，效果取决于骨骼布局和权重。请用你自己准备的模型测试。
 
 ## 文件限制与内存保护

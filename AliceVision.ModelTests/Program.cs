@@ -52,6 +52,9 @@ var tests = new (string Name, Action Body)[]
     ("loads a packed triangle", LoadsTriangle),
     ("loads padded interleaved vertices", LoadsStridedVertices),
     ("preserves Y-up TRS and matrix translations", PreservesTransforms),
+    ("converts Numerics transforms to native columns without projective translation", ConvertsSceneColumns),
+    ("preserves scaled rotated parent chains and inverse bind transforms", PreservesSceneSkinColumns),
+    ("rejects nonfinite native column transformations", BoundsSceneColumns),
     ("preserves original bind vertices and native skin data", PreservesSkinData),
     ("preserves 307-joint and 1024-joint rigs with unsigned short influences", PreservesLargeSkinData),
     ("rejects oversized or invalid large-rig joints with actionable diagnostics", BoundsLargeSkinData),
@@ -141,6 +144,74 @@ static void PreservesTransforms()
     json["nodes"]![0]!["matrix"] = JsonNode.Parse("[1,0,0,0,0,1,0,0,0,0,1,0,4,5,6,1]");
     result = GltfDocument.Parse(Encode(json, binary));
     Assert(Vector3.Transform(Vector3.Zero, result.Nodes[0].Transform) == new Vector3(4, 5, 6), "Column-major matrix translation moved.");
+}
+
+static Vector4 NativeColumnTransform(Vector4 point, GltfSceneTransform matrix) =>
+    matrix.Column0 * point.X + matrix.Column1 * point.Y + matrix.Column2 * point.Z + matrix.Column3 * point.W;
+
+static void AssertColumnTransform(Matrix4x4 matrix, Vector4 value, string message)
+{
+    Vector4 expected = Vector4.Transform(value, matrix);
+    Vector4 native = NativeColumnTransform(value, GltfSceneTransform.FromNumerics(matrix));
+    Assert(Vector4.Distance(expected, native) < 0.0001f, message);
+}
+
+static void ConvertsSceneColumns()
+{
+    var source = Matrix4x4.CreateTranslation(2, -3, 5);
+    var columns = GltfSceneTransform.FromNumerics(source);
+    Assert(columns.Column3 == new Vector4(2, -3, 5, 1) && columns.Column0.W == 0 && columns.Column1.W == 0 && columns.Column2.W == 0,
+        "Translation must occupy the native final column, never the perspective row.");
+    AssertColumnTransform(source, new Vector4(1, 2, 3, 1), "Native column translation differs from Numerics point translation.");
+    AssertColumnTransform(source, new Vector4(1, 2, 3, 0), "Native column translation changed a direction vector.");
+
+    // The former scalar-constructor copy interpreted Numerics source rows as
+    // native rows. Transposing those into columns reproduces the faulty bridge.
+    var formerColumns = new GltfSceneTransform(
+        new Vector4(source.M11, source.M21, source.M31, source.M41),
+        new Vector4(source.M12, source.M22, source.M32, source.M42),
+        new Vector4(source.M13, source.M23, source.M33, source.M43),
+        new Vector4(source.M14, source.M24, source.M34, source.M44));
+    Vector4 wrong = NativeColumnTransform(new Vector4(1, 2, 3, 1), formerColumns);
+    Assert(wrong.W != 1 && Vector4.Distance(wrong, new Vector4(3, -1, 8, 1)) > 1,
+        "Synthetic translated-bone counterexample no longer detects the old perspective-row corruption.");
+}
+
+static void PreservesSceneSkinColumns()
+{
+    var rotation = Matrix4x4.CreateFromQuaternion(Quaternion.CreateFromYawPitchRoll(0.31f, -0.48f, 0.27f));
+    var local = Matrix4x4.CreateScale(2, 0.5f, 1.5f) * rotation * Matrix4x4.CreateTranslation(0.2f, 1.7f, -0.4f);
+    var parent = Matrix4x4.CreateRotationX(-0.6f) * Matrix4x4.CreateTranslation(2.1f, 0.3f, -1.2f);
+    var world = local * parent;
+    var point = new Vector4(0.35f, 0.7f, -0.2f, 1);
+    var direction = new Vector4(-0.7f, 0.2f, 0.9f, 0);
+    AssertColumnTransform(local, point, "Native scaled-quaternion local point transform changed.");
+    AssertColumnTransform(local, direction, "Native scaled-quaternion local direction transform changed.");
+    AssertColumnTransform(world, point, "Native parent-chain point transform changed.");
+    Vector4 nested = NativeColumnTransform(NativeColumnTransform(point, GltfSceneTransform.FromNumerics(local)),
+        GltfSceneTransform.FromNumerics(parent));
+    Assert(Vector4.Distance(nested, Vector4.Transform(point, world)) < 0.0001f,
+        "Native column multiplication order did not preserve child-then-parent transforms.");
+    Assert(Matrix4x4.Invert(world, out Matrix4x4 inverseBind), "Synthetic bind transform must be invertible.");
+    Vector4 bindThenJoint = NativeColumnTransform(NativeColumnTransform(point, GltfSceneTransform.FromNumerics(inverseBind)),
+        GltfSceneTransform.FromNumerics(world));
+    Assert(Vector4.Distance(bindThenJoint, point) < 0.0001f,
+        "Inverse bind and joint world columns did not cancel in the unchanged bind pose.");
+    AssertColumnTransform(inverseBind, point, "Native inverse-bind point transform changed.");
+    AssertColumnTransform(inverseBind, direction, "Native inverse-bind direction transform changed.");
+}
+
+static void BoundsSceneColumns()
+{
+    foreach (float invalid in new[] { float.NaN, float.PositiveInfinity, float.NegativeInfinity })
+    {
+        var matrix = Matrix4x4.Identity;
+        matrix.M41 = invalid;
+        bool rejected = false;
+        try { _ = GltfSceneTransform.FromNumerics(matrix); }
+        catch (InvalidDataException) { rejected = true; }
+        Assert(rejected, "Nonfinite matrix reached native column storage.");
+    }
 }
 
 static void PreservesSkinData()
