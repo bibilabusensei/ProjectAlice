@@ -16,7 +16,7 @@ namespace AliceVision.iOS;
 /// <summary>Single local-file model import; the picker first copies a selected file into the app.</summary>
 public static class CharacterImporter
 {
-    public const long MaximumFileBytes = 80L * 1024L * 1024L;
+    public const long MaximumFileBytes = 1L << 30;
     public static IReadOnlyList<string> AllowedExtensions { get; } = new[] { ".usdz", ".dae", ".obj", ".glb", ".vrm" };
 
     public static CharacterAsset Load(string localPath)
@@ -26,12 +26,12 @@ public static class CharacterImporter
         string extension = Path.GetExtension(path).ToLowerInvariant();
         if (!AllowedExtensions.Contains(extension, StringComparer.Ordinal))
         {
-            throw new NotSupportedException("当前支持 USDZ、DAE、OBJ、二进制 GLB 和 VRM 静态预览。请先从 Blender 导出；暂不直接读取 .blend 或 FBX。");
+            throw new NotSupportedException("当前支持 USDZ、DAE、OBJ、二进制 GLB 和 VRM。请先从 Blender 导出；暂不直接读取 .blend 或 FBX。");
         }
         var file = new FileInfo(path);
         if (!file.Exists || file.Length <= 0 || file.Length > MaximumFileBytes)
         {
-            throw new InvalidDataException("模型文件为空、不存在或超过 80 MB。");
+            throw new InvalidDataException("模型文件为空、不存在或超过 1 GB（1024 MB）。");
         }
         if ((file.Attributes & FileAttributes.ReparsePoint) != 0)
         {
@@ -50,9 +50,12 @@ public static class CharacterImporter
             try
             {
                 _ = SanitizeAndCollect(preview, clearShaders: false);
+                var actions = CharacterMotion.ActionsForImportedRig(preview);
                 return new CharacterAsset(Path.GetFileNameWithoutExtension(path),
-                    "GLB / VRM 静态姿态预览：支持网格与基本颜色 / 贴图，暂不播放骨骼动画、表情或 VRM 物理。不会自动生成行走步态。",
-                    preview, Array.Empty<string>());
+                    actions.Count > 1
+                        ? "已保留 VRM 人形骨骼与蒙皮，可使用应用提供的招呼、挥手、点头、鞠躬、原地步态和舞动；不播放文件动画、表情或弹簧物理。"
+                        : "GLB / VRM 网格和贴图预览；未找到完整可用的人形蒙皮绑定，暂只支持待机、转向与空间平移，不宣告骨骼动作。",
+                    preview, Array.Empty<string>(), actions);
             }
             catch
             {
@@ -142,6 +145,7 @@ public static class CharacterImporter
         }
         var clips = new HashSet<string>(StringComparer.Ordinal);
         long vertexTotal = 0;
+        long triangleTotal = 0;
         foreach (var node in nodes)
         {
             node.Camera = null;
@@ -166,6 +170,10 @@ public static class CharacterImporter
                 {
                     throw new InvalidDataException("模型超过 30 万顶点，请先在 Blender 中简化。");
                 }
+                foreach (var element in geometry.GeometryElements)
+                    triangleTotal = checked(triangleTotal + (long)element.PrimitiveCount);
+                if (triangleTotal > 500_000)
+                    throw new InvalidDataException("模型超过 50 万面，请先简化网格。");
                 foreach (var material in geometry.Materials)
                 {
                     if (clearShaders)
@@ -200,6 +208,8 @@ public static class CharacterImporter
 
     private static void ValidateObj(string path)
     {
+        if (new FileInfo(path).Length > 80L * 1024 * 1024)
+            throw new InvalidDataException("OBJ 文本超过 80 MB 解析预算；大文件请使用二进制 GLB / VRM 或 USDZ。");
         using var reader = new StreamReader(path, Encoding.UTF8, true);
         string? line;
         while ((line = reader.ReadLine()) is not null)
@@ -218,21 +228,24 @@ public static class CharacterImporter
         {
             DtdProcessing = DtdProcessing.Prohibit,
             XmlResolver = null,
-            MaxCharactersInDocument = MaximumFileBytes
+            MaxCharactersInDocument = 80L * 1024 * 1024
         });
-        var document = XDocument.Load(reader, LoadOptions.None);
-        foreach (var attribute in document.Descendants().Attributes())
+        int imageDepth = -1;
+        while (reader.Read())
         {
-            if (attribute.Name.LocalName is "url" or "href" or "src" &&
-                !string.IsNullOrWhiteSpace(attribute.Value) && !attribute.Value.StartsWith('#'))
+            if (reader.NodeType == XmlNodeType.EndElement && reader.Depth <= imageDepth) imageDepth = -1;
+            if (reader.NodeType != XmlNodeType.Element) continue;
+            if (reader.LocalName == "image" && !reader.IsEmptyElement) imageDepth = reader.Depth;
+            if (imageDepth >= 0 && reader.LocalName == "init_from" && !reader.IsEmptyElement)
+                throw new InvalidDataException("此 DAE 需要独立纹理；单文件导入请使用包含贴图的 USDZ。");
+            if (!reader.HasAttributes) continue;
+            while (reader.MoveToNextAttribute())
             {
-                throw new InvalidDataException("此 DAE 引用了外部文件；请改用包含全部贴图的 USDZ。");
+                if (reader.LocalName is "url" or "href" or "src" &&
+                    !string.IsNullOrWhiteSpace(reader.Value) && !reader.Value.StartsWith('#'))
+                    throw new InvalidDataException("此 DAE 引用了外部文件；请改用包含全部贴图的 USDZ。");
             }
-        }
-        if (document.Descendants().Where(element => element.Name.LocalName == "image")
-            .Descendants().Any(element => element.Name.LocalName == "init_from" && !string.IsNullOrWhiteSpace(element.Value)))
-        {
-            throw new InvalidDataException("此 DAE 需要独立纹理；单文件导入请使用包含贴图的 USDZ。");
+            reader.MoveToElement();
         }
     }
 
@@ -266,7 +279,7 @@ public static class CharacterImporter
             total = checked(total + entry.Length);
             if (total > MaximumFileBytes)
             {
-                throw new InvalidDataException("USDZ 内容超过 80 MB。");
+                throw new InvalidDataException("USDZ 内容超过 1 GB（1024 MB）。");
             }
         }
         if (Path.GetExtension(archive.Entries[0].FullName).ToLowerInvariant() is not (".usd" or ".usda" or ".usdc"))
@@ -275,6 +288,10 @@ public static class CharacterImporter
         }
         foreach (var entry in archive.Entries.Where(entry => Path.GetExtension(entry.FullName).Equals(".usda", StringComparison.OrdinalIgnoreCase)))
         {
+            // The file ceiling is not a promise to fit arbitrary text scenes in
+            // RAM. Binary USDC is the recommended format for large USDZ assets.
+            if (entry.Length > 16L * 1024 * 1024)
+                throw new InvalidDataException("USDZ 文本场景超过 16 MB 解析预算；请导出为二进制 USDC 场景。");
             using var stream = entry.Open();
             using var reader = new StreamReader(stream, Encoding.UTF8, true);
             string text = reader.ReadToEnd();

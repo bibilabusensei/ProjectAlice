@@ -25,13 +25,19 @@ if (args.Length == 2 && args[0] == "--inspect-model")
                     Vector3 point = Vector3.Transform(new Vector3(primitive.Positions[i], primitive.Positions[i + 1], primitive.Positions[i + 2]), world);
                     minimum = Vector3.Min(minimum, point); maximum = Vector3.Max(maximum, point);
                 }
+                if (primitive.Skin is { } skin)
+                {
+                    minimum = Vector3.Min(minimum, skin.RestBoundsMinimum);
+                    maximum = Vector3.Max(maximum, skin.RestBoundsMaximum);
+                }
             }
             foreach (int child in node.Children) pending.Push((child, world));
         }
         Console.WriteLine($"Model parsed: {model.Nodes.Count} nodes, {primitives} primitives, {vertices} vertices, {triangles} triangles.");
         Console.WriteLine($"Embedded resources: {model.Images.Count} images, {model.Textures.Count} textures, {model.Materials.Count} materials.");
         Console.WriteLine($"World bounds minimum={minimum}, maximum={maximum}, size={maximum - minimum}.");
-        Console.WriteLine($"Static preview: skin={model.HasSkin}, ignored morphs={model.HasMorphs}, ignored animations={model.HasAnimations}.");
+        Console.WriteLine($"Preserved skin={model.HasSkin}, humanoid bones={model.HumanBones.Count}, ignored morphs={model.HasMorphs}, ignored file animations={model.HasAnimations}.");
+        Console.WriteLine("Humanoid mapping: " + string.Join(", ", model.HumanBones.Keys));
         return 0;
     }
     catch (InvalidDataException error)
@@ -46,7 +52,12 @@ var tests = new (string Name, Action Body)[]
     ("loads a packed triangle", LoadsTriangle),
     ("loads padded interleaved vertices", LoadsStridedVertices),
     ("preserves Y-up TRS and matrix translations", PreservesTransforms),
-    ("preserves bind pose and bakes current bone transform", BakesSkinPose),
+    ("preserves original bind vertices and native skin data", PreservesSkinData),
+    ("validates legacy and modern VRM humanoid maps", ValidatesHumanBones),
+    ("streams large sparse files without whole-file allocation", StreamsLargeFile),
+    ("accepts exact 1 GiB boundary with bounded allocation", AcceptsExactFileBoundary),
+    ("rejects files beyond 1 GiB before allocation", RejectsOversizedFile),
+    ("streams component ranges across page boundaries", StreamsPageBoundary),
     ("loads embedded PNG and PBR material metadata", LoadsPngMaterial),
     ("accepts exporter identity texture transform but rejects actual transforms", IdentityTextureTransform),
     ("reports ignored morphs and animations", ReportsStaticPreview),
@@ -114,15 +125,119 @@ static void PreservesTransforms()
     Assert(Vector3.Transform(Vector3.Zero, result.Nodes[0].Transform) == new Vector3(4, 5, 6), "Column-major matrix translation moved.");
 }
 
-static void BakesSkinPose()
+static void PreservesSkinData()
 {
     var (json, binary) = SkinnedTriangle();
     var result = GltfDocument.Parse(Encode(json, binary));
-    Assert(result.HasSkin && result.Nodes[0].Primitives[0].Positions[1] == 0, "Inverse bind matrix did not preserve bind pose.");
+    var primitive = result.Nodes[0].Primitives[0];
+    Assert(result.HasSkin && primitive.Positions[1] == 0 && primitive.Skin is not null, "Original bind geometry or skin binding was lost.");
+    var skin = primitive.Skin ?? throw new InvalidOperationException("Native skin binding missing.");
+    Assert(skin.Joints.SequenceEqual(new[] { 1 }) && skin.Weights[0] == 1 && skin.BoneIndices[0] == 0,
+        "Joint/weight buffers must remain usable for native skinning.");
+    Assert(skin.RestBoundsMinimum.Y == 0 && skin.RestBoundsMaximum.Y == 1, "Bind-world bounds are incorrect.");
     json["nodes"]![1]!["translation"] = JsonNode.Parse("[0,3,0]");
     result = GltfDocument.Parse(Encode(json, binary));
-    Assert(result.Nodes[0].Primitives[0].Positions[1] == 1 && result.Nodes[0].Primitives[0].Positions[7] == 2,
-        "Default bone pose was not baked into static vertices.");
+    primitive = result.Nodes[0].Primitives[0];
+    Assert(primitive.Positions[1] == 0 && primitive.Positions[7] == 1,
+        "Native skinning must not receive CPU-baked vertices (double-transform risk).");
+    Assert(primitive.Skin!.RestBoundsMinimum.Y == 1 && primitive.Skin.RestBoundsMaximum.Y == 2,
+        "Native skin pose normalization must use evaluated rest-world bounds.");
+}
+
+static void ValidatesHumanBones()
+{
+    var (json, binary) = SkinnedTriangle();
+    json["extensions"] = JsonNode.Parse("{\"VRM\":{\"humanoid\":{\"humanBones\":[{\"bone\":\"head\",\"node\":1}]}}}");
+    Assert(GltfDocument.Parse(Encode(json, binary)).HumanBones["head"] == 1, "VRM0 humanBones map lost.");
+    json["extensions"] = JsonNode.Parse("{\"VRMC_vrm\":{\"humanoid\":{\"humanBones\":{\"head\":{\"node\":1}}}}}");
+    Assert(GltfDocument.Parse(Encode(json, binary)).HumanBones["head"] == 1, "VRM1 humanBones map lost.");
+    json["extensions"]!["VRMC_vrm"]!["humanoid"]!["humanBones"]!["head"]!["node"] = 42;
+    Reject(Encode(json, binary));
+    json["extensions"] = JsonNode.Parse("{\"VRM\":{\"humanoid\":{\"humanBones\":[{\"bone\":\"head\",\"node\":1},{\"bone\":\"hips\",\"node\":1}]}}}");
+    Reject(Encode(json, binary));
+    json["extensions"] = JsonNode.Parse("{\"VRM\":{\"humanoid\":{\"humanBones\":[{\"bone\":\"unknown\",\"node\":1}]}}}");
+    Reject(Encode(json, binary));
+    json["extensions"] = JsonNode.Parse("{\"VRM\":{\"humanoid\":{\"humanBones\":[{\"bone\":\"head\",\"node\":1}]}}}");
+    json["scenes"]![0]!["nodes"] = JsonNode.Parse("[0]");
+    Reject(Encode(json, binary));
+}
+
+static void StreamsLargeFile()
+{
+    var (json, binary) = Triangle();
+    string path = Path.Combine(Path.GetTempPath(), "AliceVision-stream-test-" + Guid.NewGuid().ToString("N") + ".glb");
+    try
+    {
+        const int binLength = 96 * 1024 * 1024;
+        WriteSparseGlb(path, json, binary, binLength);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        var result = GltfDocument.Load(path);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert(result.Nodes[0].Primitives[0].Positions[7] == 1, "Large GLB referenced data was not read.");
+        Assert(allocated < 8 * 1024 * 1024, "Reader allocated a whole-file-sized buffer.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void RejectsOversizedFile()
+{
+    string path = Path.Combine(Path.GetTempPath(), "AliceVision-limit-test-" + Guid.NewGuid().ToString("N") + ".glb");
+    try
+    {
+        using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write)) file.SetLength((long)GltfDocument.MaximumFileBytes + 1);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        bool rejected = false;
+        try { _ = GltfDocument.Load(path); } catch (InvalidDataException) { rejected = true; }
+        Assert(rejected && GC.GetAllocatedBytesForCurrentThread() - before < 1024 * 1024, "Oversized GLB must fail before a large allocation.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void AcceptsExactFileBoundary()
+{
+    var (json, binary) = Triangle();
+    string path = Path.Combine(Path.GetTempPath(), "AliceVision-exact-limit-test-" + Guid.NewGuid().ToString("N") + ".glb");
+    try
+    {
+        json["buffers"]![0]!["byteLength"] = GltfDocument.MaximumFileBytes;
+        int jsonLength = (Encoding.UTF8.GetByteCount(json.ToJsonString()) + 3) & ~3;
+        WriteSparseGlb(path, json, binary, GltfDocument.MaximumFileBytes - 28 - jsonLength);
+        Assert(new FileInfo(path).Length == GltfDocument.MaximumFileBytes, "Fixture must hit the exact accepted byte boundary.");
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        Assert(GltfDocument.Load(path).Nodes[0].Primitives.Count == 1, "Exact 1 GiB boundary should load selected small ranges.");
+        Assert(GC.GetAllocatedBytesForCurrentThread() - before < 8 * 1024 * 1024, "1 GiB file path allocated an unbounded buffer.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void StreamsPageBoundary()
+{
+    var (json, original) = Triangle();
+    byte[] binary = new byte[65532 + 42]; original.CopyTo(binary, 65532);
+    json["bufferViews"]![0]!["byteOffset"] = 65532;
+    json["bufferViews"]![1]!["byteOffset"] = 65532 + 36;
+    string path = Path.Combine(Path.GetTempPath(), "AliceVision-page-test-" + Guid.NewGuid().ToString("N") + ".glb");
+    try
+    {
+        WriteSparseGlb(path, json, binary, (binary.Length + 3) & ~3);
+        Assert(GltfDocument.Load(path).Nodes[0].Primitives[0].Positions.SequenceEqual(new float[] { 0,0,0,1,0,0,0,1,0 }),
+            "Sequential accessor read failed at the file page boundary.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void WriteSparseGlb(string path, JsonObject json, byte[] binary, int binLength)
+{
+    json["buffers"]![0]!["byteLength"] = binLength;
+    byte[] text = Encoding.UTF8.GetBytes(json.ToJsonString());
+    int jsonLength = (text.Length + 3) & ~3;
+    using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write);
+    using var writer = new BinaryWriter(file, Encoding.UTF8, leaveOpen: true);
+    writer.Write(0x46546c67u); writer.Write(2u); writer.Write((uint)(28L + jsonLength + binLength));
+    writer.Write((uint)jsonLength); writer.Write(0x4e4f534au); writer.Write(text);
+    for (int i = text.Length; i < jsonLength; i++) writer.Write((byte)32);
+    writer.Write((uint)binLength); writer.Write(0x004e4942u); writer.Write(binary);
+    writer.Flush(); file.SetLength(28L + jsonLength + binLength);
 }
 
 static void LoadsPngMaterial()

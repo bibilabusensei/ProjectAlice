@@ -20,22 +20,27 @@ public sealed class CharacterAsset : IDisposable
         _factory = factory;
         IsBuiltIn = true;
         AnimationNames = Array.Empty<string>();
+        AvailableActions = CharacterMotion.AllHumanoidActions;
     }
 
-    internal CharacterAsset(string name, string description, SCNNode prototype, IEnumerable<string> animationNames)
+    internal CharacterAsset(string name, string description, SCNNode prototype, IEnumerable<string> animationNames,
+        IEnumerable<string>? availableActions = null)
     {
         DisplayName = name;
         Description = description;
         _prototype = prototype;
         AnimationNames = animationNames.Distinct(StringComparer.Ordinal).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        AvailableActions = (availableActions ?? new[] { "idle" }).Where(CharacterMotion.IsKnownAction)
+            .Distinct(StringComparer.Ordinal).ToArray();
     }
 
     public string DisplayName { get; }
     public string Description { get; }
     public bool IsBuiltIn { get; }
-    public bool SupportsWave => IsBuiltIn;
-    public bool SupportsWalkAnimation => IsBuiltIn;
+    public bool SupportsWave => AvailableActions.Contains("wave", StringComparer.Ordinal);
+    public bool SupportsWalkAnimation => AvailableActions.Contains("walk", StringComparer.Ordinal);
     public IReadOnlyList<string> AnimationNames { get; }
+    public IReadOnlyList<string> AvailableActions { get; }
 
     public SCNNode CreateNode(float heightMeters = 0.35f)
     {
@@ -73,6 +78,8 @@ public sealed class CharacterAsset : IDisposable
             -minimum.Y * scale,
             -(minimum.Z * 0.5f + maximum.Z * 0.5f) * scale);
         container.AddChildNode(scaled);
+        try { CharacterMotion.Prepare(this, container); }
+        catch { container.Dispose(); throw; }
         return container;
     }
 

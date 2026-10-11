@@ -8,7 +8,7 @@
   <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
   <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>arkit</string></array>
   <key>NSCameraUsageDescription</key>
-  <string>使用后置摄像头和 LiDAR 扫描水平面，将你选择的 3D 角色放在真实环境中。相机画面仅在本机处理，不上传。</string>
+  <string>使用后置摄像头和 LiDAR 将 3D 角色放在真实环境中。默认本机处理；仅当你同意并启动 AI 时，才会定期将当前画面发送到你配置的视觉 API。可随时急停。</string>
   <key>XSAppIconAssets</key><string>Assets.xcassets/AppIcon.appiconset</string>
   <key>UILaunchScreen</key><dict/>
   <key>UIApplicationSceneManifest</key>

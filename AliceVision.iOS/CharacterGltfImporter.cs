@@ -9,24 +9,34 @@ using UIKit;
 namespace AliceVision.iOS;
 
 /// <summary>
-/// Displays validated embedded GLB / VRM geometry in a static initial pose.
-/// No imported animations, expressions, spring bones, shaders or scripts are executed.
+/// Displays validated embedded GLB / VRM geometry with native skinning.
+/// Only app-authored humanoid poses run; imported clips, expressions, spring bones,
+/// model shaders and scripts are never executed.
 /// </summary>
 internal static class CharacterGltfImporter
 {
-    public const bool SupportsWave = false;
-    public const bool SupportsWalk = false;
+    internal const string RigRoot = "AliceVision.GLBRig";
+    internal const string BonePrefix = "AliceVision.Humanoid.";
     public const int MaximumPreviewTextureEdge = 1024;
 
     public static SCNNode Load(string localPath)
     {
         GltfDocument document = GltfDocument.Load(localPath);
-        var root = new SCNNode { Name = "AliceVision.StaticGLBPreview" };
+        var root = new SCNNode { Name = RigRoot };
+        var selectedNodes = new HashSet<int>();
+        var pendingNodes = new Stack<int>(document.Roots);
+        while (pendingNodes.TryPop(out int index))
+        {
+            if (!selectedNodes.Add(index)) continue;
+            foreach (int child in document.Nodes[index].Children) pendingNodes.Push(child);
+        }
+        var selectedMaterials = selectedNodes.SelectMany(index => document.Nodes[index].Primitives)
+            .Select(primitive => primitive.Material).Where(index => index >= 0).ToHashSet();
         var decodedImages = new UIImage?[document.Images.Count];
-        var nativeMaterials = new List<SCNMaterial>();
+        var nativeMaterials = new SCNMaterial?[document.Materials.Count];
         try
         {
-            var referencedImages = document.Materials.Where(material => material.Texture >= 0)
+            var referencedImages = selectedMaterials.Select(index => document.Materials[index]).Where(material => material.Texture >= 0)
                 .Select(material => document.Textures[material.Texture].Image).ToHashSet();
             for (int imageIndex = 0; imageIndex < document.Images.Count; imageIndex++)
             {
@@ -55,8 +65,8 @@ internal static class CharacterGltfImporter
                     throw;
                 }
             }
-            foreach (GltfMaterial source in document.Materials)
-                nativeMaterials.Add(CreateMaterial(source, document, decodedImages));
+            foreach (int index in selectedMaterials)
+                nativeMaterials[index] = CreateMaterial(document.Materials[index], document, decodedImages);
             using var defaultMaterial = new SCNMaterial
             {
                 LightingModelName = SCNLightingModel.PhysicallyBased,
@@ -70,14 +80,44 @@ internal static class CharacterGltfImporter
             for (int i = 0; i < nodes.Length; i++)
             {
                 GltfNode source = document.Nodes[i];
-                var node = new SCNNode { Name = source.Name, Transform = ToSceneMatrix(source.Transform) };
+                nodes[i] = new SCNNode { Name = source.Name, Transform = ToSceneMatrix(source.Transform) };
+            }
+            foreach (var bone in document.HumanBones)
+                nodes[bone.Value].Name = BonePrefix + bone.Key;
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                GltfNode source = document.Nodes[i];
+                if (!selectedNodes.Contains(i)) continue;
                 foreach (GltfPrimitive primitive in source.Primitives)
                 {
                     using var geometry = CreateGeometry(primitive);
-                    geometry.Materials = new[] { primitive.Material < 0 ? defaultMaterial : nativeMaterials[primitive.Material] };
-                    node.AddChildNode(SCNNode.FromGeometry(geometry));
+                    geometry.Materials = new[] { primitive.Material < 0 ? defaultMaterial : nativeMaterials[primitive.Material]! };
+                    var mesh = SCNNode.FromGeometry(geometry);
+                    if (primitive.Skin is { } binding)
+                    {
+                        using var weights = CreateSource(binding.Weights, 4, SCNGeometrySourceSemantics.BoneWeights);
+                        byte[] indexBytes = new byte[binding.BoneIndices.Length * sizeof(ushort)];
+                        Buffer.BlockCopy(binding.BoneIndices, 0, indexBytes, 0, indexBytes.Length);
+                        using var indexData = NSData.FromArray(indexBytes);
+                        using var indices = SCNGeometrySource.FromData(indexData, SCNGeometrySourceSemantics.BoneIndices,
+                            binding.BoneIndices.Length / 4, false, 4, sizeof(ushort), 0, 4 * sizeof(ushort));
+                        using var skinner = SCNSkinner.Create(geometry, binding.Joints.Select(index => nodes[index]).ToArray(),
+                            binding.InverseBindMatrices.Select(ToSceneMatrix).ToArray(), weights, indices);
+                        skinner.BaseGeometryBindTransform = SCNMatrix4.Identity;
+                        skinner.Skeleton = binding.Skeleton >= 0 ? nodes[binding.Skeleton] : root;
+                        mesh.Skinner = skinner;
+                        mesh.Name = "AliceVision.SkinnedMesh";
+                        var minimum = new SCNVector3(binding.RestBoundsMinimum.X, binding.RestBoundsMinimum.Y, binding.RestBoundsMinimum.Z);
+                        var maximum = new SCNVector3(binding.RestBoundsMaximum.X, binding.RestBoundsMaximum.Y, binding.RestBoundsMaximum.Z);
+                        mesh.SetBoundingBox(ref minimum, ref maximum);
+                        // glTF requires ignoring the skinned mesh node's world
+                        // transform: jointWorld * inverseBind places its vertices.
+                        // An identity child of the common content root implements
+                        // that rule while retaining the original joint hierarchy.
+                        root.AddChildNode(mesh);
+                    }
+                    else nodes[i].AddChildNode(mesh);
                 }
-                nodes[i] = node;
             }
             for (int i = 0; i < nodes.Length; i++)
                 foreach (int child in document.Nodes[i].Children) nodes[i].AddChildNode(nodes[child]);
@@ -93,7 +133,7 @@ internal static class CharacterGltfImporter
         }
         finally
         {
-            foreach (var material in nativeMaterials) material.Dispose();
+            foreach (var material in nativeMaterials) material?.Dispose();
             foreach (var image in decodedImages) image?.Dispose();
         }
     }

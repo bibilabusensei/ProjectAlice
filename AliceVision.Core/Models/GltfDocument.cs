@@ -4,7 +4,10 @@ using System.Text.Json;
 
 namespace AliceVision.Core.Models;
 
-public sealed record GltfPrimitive(float[] Positions, float[]? Normals, float[]? Texcoords, uint[] Indices, int Material);
+public sealed record GltfSkinBinding(int[] Joints, Matrix4x4[] InverseBindMatrices, float[] Weights,
+    ushort[] BoneIndices, int Skeleton, Vector3 RestBoundsMinimum, Vector3 RestBoundsMaximum);
+public sealed record GltfPrimitive(float[] Positions, float[]? Normals, float[]? Texcoords, uint[] Indices, int Material,
+    GltfSkinBinding? Skin = null);
 public sealed record GltfNode(string Name, Matrix4x4 Transform, int[] Children, IReadOnlyList<GltfPrimitive> Primitives);
 public sealed record GltfImage(byte[] Bytes, string MimeType, int Width, int Height);
 public sealed record GltfTexture(int Image, int WrapS, int WrapT);
@@ -13,21 +16,24 @@ public sealed record GltfMaterial(Vector4 BaseColor, int Texture, float Metallic
 
 /// <summary>
 /// Conservative, self-contained GLB 2.0 reader. It never resolves URIs or runs code.
-/// VRM is rendered in its initial static pose; animation, morphs and physics are not imported.
+/// Preserves validated skin influences and VRM humanoid mappings for native posing.
+/// Authored animation clips, morphs and spring physics are not imported.
 /// </summary>
 public sealed class GltfDocument
 {
-    public const int MaximumFileBytes = 80 * 1024 * 1024;
+    public const int MaximumFileBytes = 1 << 30;
     public const int MaximumVertices = 300_000;
     public const int MaximumTriangles = 500_000;
     public const int MaximumNodes = 4096;
     public const long MaximumImagePixels = 16L * 1024 * 1024;
     public const long MaximumTotalImagePixels = 64L * 1024 * 1024;
     private GltfDocument(GltfNode[] nodes, int[] roots, GltfImage[] images, GltfTexture[] textures,
-        GltfMaterial[] materials, bool hasSkin, bool hasMorphs, bool hasAnimations)
+        GltfMaterial[] materials, bool hasSkin, bool hasMorphs, bool hasAnimations,
+        IReadOnlyDictionary<string, int> humanBones)
     {
         Nodes = nodes; Roots = roots; Images = images; Textures = textures; Materials = materials;
         HasSkin = hasSkin; HasMorphs = hasMorphs; HasAnimations = hasAnimations;
+        HumanBones = humanBones;
     }
     public IReadOnlyList<GltfNode> Nodes { get; }
     public IReadOnlyList<int> Roots { get; }
@@ -37,15 +43,11 @@ public sealed class GltfDocument
     public bool HasSkin { get; }
     public bool HasMorphs { get; }
     public bool HasAnimations { get; }
+    public IReadOnlyDictionary<string, int> HumanBones { get; }
 
     public static GltfDocument Load(string path)
     {
-        using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        if (file.Length is < 28 or > MaximumFileBytes) throw Invalid("GLB 文件为空或超过 80 MB。");
-        byte[] bytes = new byte[checked((int)file.Length)];
-        file.ReadExactly(bytes);
-        if (file.ReadByte() != -1) throw Invalid("读取期间模型文件发生变化。");
-        return Parse(bytes);
+        return GltfFileSource.Read(path, ReadDocument);
     }
 
     public static GltfDocument Parse(ReadOnlyMemory<byte> bytes)
@@ -76,6 +78,11 @@ public sealed class GltfDocument
             offset += (int)length;
         }
         if (json.IsEmpty || binary.IsEmpty) throw Invalid("模型缺少嵌入几何数据。");
+        return ReadDocument(json, new GltfMemorySource(binary));
+    }
+
+    private static GltfDocument ReadDocument(ReadOnlyMemory<byte> json, GltfBinarySource binary)
+    {
         try
         {
             using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 64 });
@@ -93,7 +100,8 @@ public sealed class GltfDocument
     private sealed class Reader
     {
         private readonly JsonElement _root;
-        private ReadOnlyMemory<byte> _binary;
+        private readonly GltfBinarySource _binary;
+        private int _declaredBinaryLength;
         private View[] _views = [];
         private Accessor[] _accessors = [];
         private JsonElement[] _rawNodes = [], _rawMeshes = [], _rawSkins = [];
@@ -104,9 +112,9 @@ public sealed class GltfDocument
         private bool _hasMorphs;
         private sealed record View(int Offset, int Length, int Stride);
         private sealed record Accessor(int View, int Offset, int Count, int Component, int Components, string Type, bool Normalized);
-        private sealed record Skin(int[] Joints, Matrix4x4[] InverseBind);
+        private sealed record Skin(int[] Joints, Matrix4x4[] InverseBind, int Skeleton);
 
-        public Reader(JsonElement root, ReadOnlyMemory<byte> binary) { _root = root; _binary = binary; }
+        public Reader(JsonElement root, GltfBinarySource binary) { _root = root; _binary = binary; }
 
         public GltfDocument Read()
         {
@@ -126,7 +134,7 @@ public sealed class GltfDocument
             int declaredLength = Integer(buffers[0], "byteLength");
             if (declaredLength < 1 || declaredLength > _binary.Length || _binary.Length - declaredLength > 3)
                 throw Invalid("嵌入缓冲区大小不匹配。");
-            _binary = _binary[..declaredLength];
+            _declaredBinaryLength = declaredLength;
             ReadViewsAndAccessors();
             GltfImage[] images = ReadImages();
             GltfTexture[] textures = ReadTextures(images.Length);
@@ -152,14 +160,21 @@ public sealed class GltfDocument
             if (roots.Length == 0) throw Invalid("模型场景没有可显示的根节点。");
             var pending = new Stack<int>(roots);
             bool hasVisibleMesh = false;
+            var visibleNodes = new HashSet<int>();
             while (pending.TryPop(out int node))
             {
+                visibleNodes.Add(node);
                 hasVisibleMesh |= nodes[node].Primitives.Count > 0;
                 foreach (int child in _children[node]) pending.Push(child);
             }
             if (!hasVisibleMesh) throw Invalid("选中的模型场景没有可显示网格。");
+            foreach (int index in visibleNodes)
+                foreach (var primitive in nodes[index].Primitives)
+                    if (primitive.Skin is { } skin && (skin.Joints.Any(joint => !visibleNodes.Contains(joint)) ||
+                        (skin.Skeleton >= 0 && !visibleNodes.Contains(skin.Skeleton))))
+                        throw Invalid("蒙皮骨骼必须包含在当前场景层级内。");
             return new GltfDocument(nodes, roots, images, textures, materials, _rawSkins.Length > 0,
-                _hasMorphs, Array(_root, "animations", 256).Length > 0);
+                _hasMorphs, Array(_root, "animations", 256).Length > 0, ReadHumanBones(visibleNodes));
         }
 
         private static void ValidateJson(JsonElement element, ref int remaining)
@@ -189,7 +204,7 @@ public sealed class GltfDocument
             {
                 int buffer = Integer(views[i], "buffer"), offset = Integer(views[i], "byteOffset", 0);
                 int length = Integer(views[i], "byteLength"), stride = Integer(views[i], "byteStride", 0);
-                if (buffer != 0 || offset < 0 || length < 1 || (long)offset + length > _binary.Length ||
+                if (buffer != 0 || offset < 0 || length < 1 || (long)offset + length > _declaredBinaryLength ||
                     (stride != 0 && (stride is < 4 or > 252 || stride % 4 != 0)))
                     throw Invalid("模型缓冲区视图越界或步幅无效。");
                 _views[i] = new View(offset, length, stride);
@@ -289,7 +304,7 @@ public sealed class GltfDocument
             var skin = _rawSkins[index];
             int[] joints = Array(skin, "joints", 256).Select(v => Index(v, _rawNodes.Length)).ToArray();
             if (joints.Length == 0 || joints.Distinct().Count() != joints.Length) throw Invalid("模型骨骼列表无效。");
-            if (skin.TryGetProperty("skeleton", out var skeleton)) _ = Index(skeleton, _rawNodes.Length);
+            int skeletonIndex = skin.TryGetProperty("skeleton", out var skeleton) ? Index(skeleton, _rawNodes.Length) : -1;
             Matrix4x4[] inverse = Enumerable.Repeat(Matrix4x4.Identity, joints.Length).ToArray();
             if (skin.TryGetProperty("inverseBindMatrices", out var accessorValue))
             {
@@ -299,7 +314,7 @@ public sealed class GltfDocument
                 float[] values = ReadValues(accessor, 16);
                 for (int i = 0; i < joints.Length; i++) inverse[i] = Matrix(values.AsSpan(i * 16, 16));
             }
-            return new Skin(joints, inverse);
+            return new Skin(joints, inverse, skeletonIndex);
         }
 
         private GltfPrimitive ReadPrimitive(JsonElement primitive, int nodeIndex, Skin? skin, int materialCount)
@@ -347,9 +362,9 @@ public sealed class GltfDocument
                 if (morphs.ValueKind != JsonValueKind.Array || morphs.GetArrayLength() > 256) throw Invalid("模型形态目标无效。");
                 _hasMorphs |= morphs.GetArrayLength() > 0;
             }
-            if (skin is not null) BakeSkin(attributes, vertices, normals, skin, nodeIndex);
+            GltfSkinBinding? binding = skin is not null ? ReadSkinBinding(attributes, vertices, normals, skin, nodeIndex) : null;
             int material = primitive.TryGetProperty("material", out var materialValue) ? Index(materialValue, materialCount) : -1;
-            return new GltfPrimitive(vertices, normals, texcoords, indices, material);
+            return new GltfPrimitive(vertices, normals, texcoords, indices, material, binding);
         }
 
         private static float[] GeneratePreviewNormals(float[] positions, uint[] indices)
@@ -391,7 +406,7 @@ public sealed class GltfDocument
             return ReadValues(index, components);
         }
 
-        private void BakeSkin(JsonElement attributes, float[] vertices, float[]? normals, Skin skin, int nodeIndex)
+        private GltfSkinBinding ReadSkinBinding(JsonElement attributes, float[] vertices, float[]? normals, Skin skin, int nodeIndex)
         {
             if (!attributes.TryGetProperty("JOINTS_0", out var jointsValue) || !attributes.TryGetProperty("WEIGHTS_0", out var weightsValue) ||
                 attributes.TryGetProperty("JOINTS_1", out _) || attributes.TryGetProperty("WEIGHTS_1", out _))
@@ -405,6 +420,9 @@ public sealed class GltfDocument
                 (weightsAccessor.Component != 5126 && !(weightsAccessor.Normalized && weightsAccessor.Component is 5121 or 5123)) ||
                 !Matrix4x4.Invert(_world[nodeIndex], out var inverseMesh)) throw Invalid("模型骨骼权重或网格变换无效。");
             float[] weights = ReadValues(weightsIndex, 4);
+            ushort[] boneIndices = new ushort[checked(vertexCount * 4)];
+            var boundsMinimum = new Vector3(float.PositiveInfinity);
+            var boundsMaximum = new Vector3(float.NegativeInfinity);
             Matrix4x4[] matrices = new Matrix4x4[skin.Joints.Length];
             for (int i = 0; i < matrices.Length; i++) matrices[i] = skin.InverseBind[i] * _world[skin.Joints[i]] * inverseMesh;
             for (int i = 0; i < vertexCount; i++)
@@ -416,24 +434,77 @@ public sealed class GltfDocument
                     float weight = weights[i * 4 + j];
                     uint joint = ReadUnsigned(joints, i, j);
                     if (weight < 0 || joint >= matrices.Length) throw Invalid("模型骨骼索引或权重越界。");
+                    boneIndices[i * 4 + j] = checked((ushort)joint);
                     total += weight;
                     blend += matrices[joint] * weight;
                 }
                 if (!float.IsFinite(total) || total < 0.001f || MathF.Abs(total - 1) > 0.05f) throw Invalid("模型骨骼权重总和无效。");
+                for (int j = 0; j < 4; j++) weights[i * 4 + j] /= total;
                 blend *= 1 / total;
                 var position = Vector3.Transform(new Vector3(vertices[i * 3], vertices[i * 3 + 1], vertices[i * 3 + 2]), blend);
                 if (!Finite(position)) throw Invalid("模型蒙皮坐标溢出。");
-                vertices[i * 3] = position.X; vertices[i * 3 + 1] = position.Y; vertices[i * 3 + 2] = position.Z;
+                var worldPosition = Vector3.Transform(position, _world[nodeIndex]);
+                if (!Finite(worldPosition)) throw Invalid("模型蒙皮全局坐标溢出。");
+                boundsMinimum = Vector3.Min(boundsMinimum, worldPosition);
+                boundsMaximum = Vector3.Max(boundsMaximum, worldPosition);
                 if (normals is not null)
                 {
                     if (!Matrix4x4.Invert(blend, out var inverse)) throw Invalid("模型法线变换不可逆。");
                     var normal = Vector3.TransformNormal(new Vector3(normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2]), Matrix4x4.Transpose(inverse));
                     if (!Finite(normal) || normal.LengthSquared() < 0.000001f) throw Invalid("模型蒙皮法线无效。");
-                    normal = Vector3.Normalize(normal);
-                    normals[i * 3] = normal.X; normals[i * 3 + 1] = normal.Y; normals[i * 3 + 2] = normal.Z;
                 }
             }
+            // Keep the source bind geometry unmodified. Baking these coordinates
+            // would apply skinning a second time when SCNSkinner evaluates bones.
+            return new GltfSkinBinding(skin.Joints, skin.InverseBind, weights, boneIndices, skin.Skeleton, boundsMinimum, boundsMaximum);
         }
+
+        private IReadOnlyDictionary<string, int> ReadHumanBones(HashSet<int> visibleNodes)
+        {
+            var result = new Dictionary<string, int>(StringComparer.Ordinal);
+            var assignedNodes = new HashSet<int>();
+            if (!_root.TryGetProperty("extensions", out var extensions)) return result;
+            bool legacy = extensions.TryGetProperty("VRM", out var vrm0);
+            bool modern = extensions.TryGetProperty("VRMC_vrm", out var vrm1);
+            if (legacy && modern) throw Invalid("模型不能同时声明两个版本的 VRM 人形骨骼。");
+            if (legacy && vrm0.TryGetProperty("humanoid", out var humanoid0))
+            {
+                foreach (var bone in Array(humanoid0, "humanBones", 64))
+                    Add(Text(bone, "bone"), Index(bone.GetProperty("node"), _rawNodes.Length));
+            }
+            if (modern && vrm1.TryGetProperty("humanoid", out var humanoid1) &&
+                humanoid1.TryGetProperty("humanBones", out var bones))
+            {
+                if (bones.ValueKind != JsonValueKind.Object) throw Invalid("VRM 人形骨骼必须是对象。");
+                int count = 0;
+                foreach (var bone in bones.EnumerateObject())
+                {
+                    if (++count > 64) throw Invalid("VRM 人形骨骼数量超过预算。");
+                    Add(bone.Name, Index(bone.Value.GetProperty("node"), _rawNodes.Length));
+                }
+            }
+            return result;
+
+            void Add(string name, int index)
+            {
+                if (!HumanBoneNames.Contains(name) || !visibleNodes.Contains(index) ||
+                    !assignedNodes.Add(index) || !result.TryAdd(name, index))
+                    throw Invalid("VRM 人形骨骼名称、场景索引或唯一性无效。");
+            }
+        }
+
+        private static readonly HashSet<string> HumanBoneNames = new(StringComparer.Ordinal)
+        {
+            "hips", "spine", "chest", "upperChest", "neck", "head", "leftEye", "rightEye", "jaw",
+            "leftUpperLeg", "leftLowerLeg", "leftFoot", "leftToes", "rightUpperLeg", "rightLowerLeg", "rightFoot", "rightToes",
+            "leftShoulder", "leftUpperArm", "leftLowerArm", "leftHand", "rightShoulder", "rightUpperArm", "rightLowerArm", "rightHand",
+            "leftThumbMetacarpal", "leftThumbProximal", "leftThumbIntermediate", "leftThumbDistal",
+            "leftIndexProximal", "leftIndexIntermediate", "leftIndexDistal", "leftMiddleProximal", "leftMiddleIntermediate", "leftMiddleDistal",
+            "leftRingProximal", "leftRingIntermediate", "leftRingDistal", "leftLittleProximal", "leftLittleIntermediate", "leftLittleDistal",
+            "rightThumbMetacarpal", "rightThumbProximal", "rightThumbIntermediate", "rightThumbDistal",
+            "rightIndexProximal", "rightIndexIntermediate", "rightIndexDistal", "rightMiddleProximal", "rightMiddleIntermediate", "rightMiddleDistal",
+            "rightRingProximal", "rightRingIntermediate", "rightRingDistal", "rightLittleProximal", "rightLittleIntermediate", "rightLittleDistal"
+        };
 
         private float[] ReadValues(int index, int components)
         {
@@ -475,7 +546,7 @@ public sealed class GltfDocument
             int size = ComponentSize(accessor.Component);
             int stride = view.Stride == 0 ? size * accessor.Components : view.Stride;
             int offset = checked(view.Offset + accessor.Offset + index * stride + component * size);
-            return _binary.Span.Slice(offset, size);
+            return _binary.Slice(offset, size);
         }
 
         private GltfImage[] ReadImages()
@@ -483,12 +554,15 @@ public sealed class GltfDocument
             var images = Array(_root, "images", 64);
             var result = new GltfImage[images.Length];
             long pixelTotal = 0;
+            long encodedTotal = 0;
             for (int i = 0; i < images.Length; i++)
             {
                 var view = _views[Index(images[i].GetProperty("bufferView"), _views.Length)];
                 string mime = Text(images[i], "mimeType");
                 if (view.Length > 20 * 1024 * 1024 || mime is not ("image/png" or "image/jpeg"))
                     throw Invalid("仅支持不超过 20 MB 的嵌入 PNG / JPEG 纹理。");
+                encodedTotal = checked(encodedTotal + view.Length);
+                if (encodedTotal > 80L * 1024 * 1024) throw Invalid("模型嵌入贴图总量超过 80 MB 内存预算。");
                 byte[] bytes = _binary.Slice(view.Offset, view.Length).ToArray();
                 (int width, int height) = ImageDimensions(bytes, mime);
                 pixelTotal += (long)width * height;

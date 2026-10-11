@@ -8,6 +8,7 @@ on:
       - 'AliceVision.Core/**'
       - 'AliceVision.Tests/**'
       - 'AliceVision.ModelTests/**'
+      - 'AliceVision.AgentTests/**'
       - 'scripts/**'
       - '.github/workflows/ios-ipa.yml'
   workflow_dispatch:
@@ -39,6 +40,8 @@ jobs:
         run: dotnet run --project AliceVision.Tests/AliceVision.Tests.csproj --configuration Release
       - name: Run model import validation tests
         run: dotnet run --project AliceVision.ModelTests/AliceVision.ModelTests.csproj --configuration Release
+      - name: Run offline AI protocol and activity-zone safety tests
+        run: dotnet run --project AliceVision.AgentTests/AliceVision.AgentTests.csproj --configuration Release
       - name: Test IPA publication guards
         run: python3 scripts/test-verify-ipa.py
 

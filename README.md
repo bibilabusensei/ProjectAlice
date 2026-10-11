@@ -1,24 +1,29 @@
 # Project Alice
 
-## 当前优先：Alice·空间伙伴 0.1.0（iPhone LiDAR）
+## 当前优先：Alice·空间伙伴 0.2.0（iPhone LiDAR）
 
 现在优先开发 `AliceVision.iOS`：原生 ARKit 后置相机预览、水平面、LiDAR 场景网格与深度、
-真实物体遮挡、角色导入与放置、手动动作和选点移动。目标测试设备为 iPhone 15 Pro。
-**AI、Android 和单摄算法暂缓；iOS 版不调用下面的边缘估算算法。**
+真实物体遮挡、角色导入与骨骼动作、视觉 API、自主活动区与禁区。目标测试设备为 iPhone 15 Pro。
+**Android 和单摄算法暂缓；iOS 版不调用下面的边缘估算算法。**
 
 打开 `ProjectAlice.iOS.sln` 查看 iPhone 项目。GitHub Actions 使用 macOS + Xcode 构建实际
 设备 ARM64 Release IPA，通过包检查后发布 GitHub Release。IPA 未签名，安装前需要你重新签名。
 
 新图标和主屏名称已加入原生安装包。内置原创角色“小光”可直接测试挥手、待机和迈步；
 也可从系统“文件”导入 USDZ / DAE / OBJ / GLB / VRM，自动调整到默认 35 cm、脚底贴合平面。
-GLB / VRM 当前仅展示基础材质与初始姿态，不包含骨骼动画、表情和弹簧物理；
+单文件导入上限 1 GB（1024 MB），但仍受几何、纹理和手机内存保护限制，不保证任意 1 GB 模型可用。
+GLB / VRM 保留皮肤与骨骼绑定，具有标准 VRM 人形映射的模型可做程序化招手、欢迎、点头、鞠躬、舞动和迈步。
+没有可识别人形骨骼的模型仍可显示；动作根据实际能力开放。不包含 GLB 原生动画片段、表情、弹簧物理或完整 MToon 还原。
 USDZ / DAE 的自带命名动画可手动播放。其他格式和着色器不保证等价还原。
 
-主界面只有“导入角色 / 角色动作 / 更多”。扫描后首次点击放置角色，再点同一平面选目标，
-在动作菜单确认移动。移动限制为已扫描的同一水平面、最多 1.5 米，并保守检查扫描网格；
+主界面提供“导入角色 / 角色动作 / 更多 / 启动 AI”和常驻急停。扫描后首次点击放置角色，再点同一平面选目标，
+在动作菜单确认移动；也可先画绿色活动区与红色禁区，让 AI 自主选择动作。移动限制为已扫描的同一水平面、每次最多 1.5 米，并保守检查扫描网格；
 这不是完整寻路，也不是可用于现实安全的避障系统。没有行走动画的模型只进行空间平移。
 
-相机画面仅在本机处理，没有网络调用、API 密钥配置或 AI 自主行为。
+默认画面仅在本机处理。明确同意并启动 AI 后，才每隔 15 秒（可设 10–120 秒）上传一张最长边 768 像素的当前 AR 画面到你配置的 HTTPS 视觉接口。
+支持自定义兼容接口、OpenRouter、Google Gemini 兼容接口，可主动获取模型列表或手填 ID。Key 仅存 iOS 钥匙串，不写入 Git、普通配置或日志。
+AI 只选择程序提供的动作和已检查目标 ID；不能执行任意坐标、代码或真实设备控制。急停、后台、区域/模型变化、追踪不稳会暂停，必须手动重新开启。
+第三方服务可能收费或保存图片，免费额度与视觉能力由服务商决定。详见 [AI 与活动区域](docs/ai-companion.md)。
 第三方角色由用户个人下载后本机导入，受限的阿罗娜模型不在仓库或公开 IPA 中。
 详见 [模型导入与阿罗娜来源](docs/character-models.md)。
 最低系统 iOS 15；当前使用 Xcode 26.2 / .NET 10.0.103。新系统按 API 向后兼容方式运行，
@@ -75,6 +80,7 @@ AliceVision/            Windows 控制台冒烟测试入口
 ```powershell
 dotnet run --project .\AliceVision.Tests\AliceVision.Tests.csproj --configuration Release
 dotnet run --project .\AliceVision.ModelTests\AliceVision.ModelTests.csproj --configuration Release
+dotnet run --project .\AliceVision.AgentTests\AliceVision.AgentTests.csproj --configuration Release
 dotnet build .\ProjectAlice.sln --configuration Debug
 ```
 

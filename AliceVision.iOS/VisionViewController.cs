@@ -13,10 +13,9 @@ using UIKit;
 
 namespace AliceVision.iOS;
 
-/// <summary>Local-only LiDAR companion with imported characters and manual actions.</summary>
-public sealed class VisionViewController : UIViewController
+/// <summary>LiDAR companion with local characters and explicitly enabled autonomy.</summary>
+public sealed partial class VisionViewController : UIViewController
 {
-    private const long MaximumModelBytes = 80L * 1024 * 1024;
     private const string MoveActionKey = "Alice.Companion.Move";
     private readonly ARSCNView _sceneView = new();
     private readonly UILabel _status = new(), _diagnosticLabel = new(), _characterLabel = new(), _instruction = new();
@@ -71,6 +70,7 @@ public sealed class VisionViewController : UIViewController
         ConfigureButton(_importButton, "导入角色", ImportCharacter);
         ConfigureButton(_actionButton, "角色动作", ShowActions);
         ConfigureButton(_moreButton, "更多", ShowMore);
+        ConfigureCompanionControls();
         _backgroundObserver = NSNotificationCenter.DefaultCenter.AddObserver(
             UIApplication.WillResignActiveNotification, _ => PauseSession());
         _activeObserver = NSNotificationCenter.DefaultCenter.AddObserver(
@@ -86,15 +86,17 @@ public sealed class VisionViewController : UIViewController
         _sceneView.Frame = bounds;
         nfloat width = (nfloat)Math.Min(580, Math.Max(180, (double)(bounds.Width - safe.Left - safe.Right - 28)));
         nfloat x = safe.Left + (bounds.Width - safe.Left - safe.Right - width) / 2;
-        _status.Frame = new CGRect(x, safe.Top + 8, width, 49);
-        _diagnosticLabel.Frame = new CGRect(x, safe.Top + 65, width, 82);
+        _status.Frame = new CGRect(x, safe.Top + 8, width - 83, 49);
+        _diagnosticLabel.Frame = new CGRect(x, safe.Top + 142, width, 82);
         _panel.Frame = new CGRect(x, bounds.Height - safe.Bottom - 143, width, 133);
         _characterLabel.Frame = new CGRect(14, 11, width - 28, 22);
         _instruction.Frame = new CGRect(14, 36, width - 28, 34);
-        nfloat buttonWidth = (width - 40) / 3;
+        nfloat buttonWidth = (width - 48) / 4;
         _importButton.Frame = new CGRect(12, 79, buttonWidth, 42);
         _actionButton.Frame = new CGRect(20 + buttonWidth, 79, buttonWidth, 42);
-        _moreButton.Frame = new CGRect(28 + buttonWidth * 2, 79, buttonWidth, 42);
+        _aiButton.Frame = new CGRect(28 + buttonWidth * 2, 79, buttonWidth, 42);
+        _moreButton.Frame = new CGRect(36 + buttonWidth * 3, 79, buttonWidth, 42);
+        LayoutCompanionControls(x, safe.Top, width);
     }
 
     public override void ViewDidAppear(bool animated)
@@ -171,6 +173,7 @@ public sealed class VisionViewController : UIViewController
 
     private void RunSession(bool reset)
     {
+        StopAutonomy("空间会话改变，AI 已暂停。");
         StopMotion();
         Interlocked.Increment(ref _sessionGeneration);
         using var configuration = new ARWorldTrackingConfiguration
@@ -187,6 +190,7 @@ public sealed class VisionViewController : UIViewController
             configuration.FrameSemantics |= ARFrameSemantics.SceneDepth;
         if (reset)
         {
+            ClearActivityZones();
             CancelImport();
             _planes.Clear(); _meshes.Clear(); _planeSurfaces.Clear(); _meshBounds.Clear();
             _characterNode?.RemoveFromParentNode(); _targetVisual?.RemoveFromParentNode();
@@ -209,6 +213,7 @@ public sealed class VisionViewController : UIViewController
     private void PauseSession()
     {
         if (_disposed) return;
+        StopAutonomy("应用离开前台，AI 已暂停。");
         StopMotion(); CancelImport();
         _running = false;
         Interlocked.Increment(ref _sessionGeneration);
@@ -245,6 +250,8 @@ public sealed class VisionViewController : UIViewController
             var hit = hits.FirstOrDefault(result => result.Anchor is ARPlaneAnchor);
             if (hit is null) { _placementMessage = "这里还没扫描好，请点击蓝色区域。"; RefreshStatus(); return; }
             string planeId = hit.Anchor!.Identifier.AsString();
+            if (HandleZoneTap(hit, planeId)) return;
+            StopAutonomy("手动选点，AI 已暂停。");
             if (_characterAnchor is null)
             {
                 _characterPlaneId = planeId;
@@ -320,6 +327,8 @@ public sealed class VisionViewController : UIViewController
 
     private void ReplaceCharacterNode(CharacterAsset? candidateAsset = null)
     {
+        StopAutonomy("角色变化，AI 已暂停。");
+        ++_assetGeneration;
         var asset = candidateAsset ?? _asset;
         // Validate even an unplaced model now, so a later AR callback cannot
         // encounter malformed flat/empty geometry for the first time.
@@ -339,6 +348,7 @@ public sealed class VisionViewController : UIViewController
             previousNode?.RemoveFromParentNode();
             _characterNode = replacement;
             transferred = true;
+            _requiresPoseReset = false;
         }
         catch
         {
@@ -368,9 +378,14 @@ public sealed class VisionViewController : UIViewController
 
     private void ShowActions()
     {
+        StopAutonomy("手动控制，AI 已暂停。"); StopMotion();
         if (_characterNode is null) { ShowNotice("先让小伙伴出现", "缓慢扫描地面，点击蓝色区域放置角色。"); return; }
         var sheet = UIAlertController.Create("角色动作", _asset.DisplayName + " · 手动触发", UIAlertControllerStyle.ActionSheet);
-        if (_asset.SupportsWave) sheet.AddAction(UIAlertAction.Create("挥手", UIAlertActionStyle.Default, _ => PlayPose("wave")));
+        foreach (string action in _asset.AvailableActions.Where(action => action is not "idle" and not "walk"))
+        {
+            string id = action;
+            sheet.AddAction(UIAlertAction.Create(ActionLabel(id), UIAlertActionStyle.Default, _ => PlayPose(id)));
+        }
         sheet.AddAction(UIAlertAction.Create("看向我", UIAlertActionStyle.Default, _ => LookAtUser()));
         sheet.AddAction(UIAlertAction.Create("待机", UIAlertActionStyle.Default, _ => PlayPose("idle")));
         var move = UIAlertAction.Create("移动到选定点（最多 1.5 米）", UIAlertActionStyle.Default, _ => MoveToTarget());
@@ -388,6 +403,7 @@ public sealed class VisionViewController : UIViewController
                 confirm.AddAction(UIAlertAction.Create("播放一次", UIAlertActionStyle.Default, _ =>
                 {
                     StopMotion();
+                    _requiresPoseReset = true;
                     if (_characterNode is not null && !CharacterMotion.PlayEmbeddedAnimation(_asset, _characterNode, name))
                         ShowNotice("无法播放这个动作", "模型里的动画没有成功加载。");
                     else { _placementMessage = "正在播放模型动画：" + name; RefreshStatus(); }
@@ -406,10 +422,10 @@ public sealed class VisionViewController : UIViewController
     {
         StopMotion();
         if (_characterNode is not null && !CharacterMotion.Play(_asset, _characterNode, pose))
-            ShowNotice("模型没有这个动作", "导入模型只播放自身带有的动画；它仍可以进行空间平移。");
+            ShowNotice("模型没有这个动作", "没有找到这个动作需要的人形骨骼映射。请使用标准 VRM 人形绑定；模型仍可显示与空间平移。");
         else
         {
-            _placementMessage = pose == "wave" ? "小伙伴正在向你挥手。" : "小伙伴正在待机。";
+            _placementMessage = "小伙伴正在" + ActionLabel(pose) + "。";
             RefreshStatus();
         }
     }
@@ -429,13 +445,28 @@ public sealed class VisionViewController : UIViewController
     private void MoveToTarget()
     {
         if (_characterNode is null || _characterAnchorNode is null || _targetAnchorNode is null) return;
+        TryMoveToWorldTarget(_targetAnchorNode.WorldPosition, false, out string reason);
+        if (!string.IsNullOrEmpty(reason)) ShowNotice("暂时不能走过去", reason);
+    }
+
+    private bool TryMoveToWorldTarget(SCNVector3 target, bool autonomous, out string reason)
+    {
+        reason = "";
+        if (_characterNode is null || _characterAnchorNode is null) { reason = "角色还未放置。"; return false; }
+        if (_requiresPoseReset)
+        {
+            try { ReplaceCharacterNode(); }
+            catch (Exception) { reason = "请先恢复角色姿势，再尝试路线移动。"; return false; }
+            if (_characterNode is null) { reason = "角色还未放置。"; return false; }
+        }
         var start = _characterNode.PresentationNode.WorldPosition;
-        var target = _targetAnchorNode.WorldPosition;
-        if (!CanMove(start, target, out string reason)) { ShowNotice("暂时不能走过去", reason); return; }
+        if (!CanMove(start, target, out reason, autonomous)) return false;
         StopMotion();
         int motion = ++_motionGeneration;
         long epoch = Interlocked.Read(ref _sessionGeneration);
         _moving = true;
+        _movingDestination = target;
+        _movingAutonomously = autonomous;
         var localTarget = _characterAnchorNode.ConvertPositionFromNode(target, null);
         var delta = localTarget - _characterNode.Position;
         _characterNode.EulerAngles = new SCNVector3(0, MathF.Atan2(delta.X, delta.Z), 0);
@@ -446,6 +477,7 @@ public sealed class VisionViewController : UIViewController
         {
             if (_disposed || motion != _motionGeneration || epoch != Interlocked.Read(ref _sessionGeneration)) return;
             _moving = false;
+            _movingDestination = null;
             _characterNode?.RemoveAction(MoveActionKey);
             if (_characterNode is not null) CharacterMotion.Play(_asset, _characterNode, "idle");
             ClearTarget();
@@ -453,34 +485,24 @@ public sealed class VisionViewController : UIViewController
         }));
         _placementMessage = hasWalk ? "正在走过去…" : "正在空间平移（这个模型没有行走动画）…";
         RefreshStatus();
+        return true;
     }
 
-    private bool CanMove(SCNVector3 start, SCNVector3 target, out string reason)
+    private bool CanMove(SCNVector3 start, SCNVector3 target, out string reason, bool autonomous = false)
     {
         reason = "";
         if (!TrackingNormal()) { reason = "空间追踪还不稳定，请放慢手机。"; return false; }
-        if (_characterPlaneId is null || _targetPlaneId != _characterPlaneId ||
+        if (_characterPlaneId is null || (!autonomous && _targetPlaneId != _characterPlaneId) ||
             !_planeSurfaces.TryGetValue(_characterPlaneId, out var plane))
         { reason = "只支持在同一块已扫描的水平面上移动。"; return false; }
         if (MathF.Abs(start.Y - target.Y) > 0.055f || (target - start).Length > 1.5f)
         { reason = "目标需与角色等高，距离不超过 1.5 米。"; return false; }
-        float radius = MathF.Max(0.09f, _height * 0.42f);
-        var minimum = new SCNVector3(); var maximum = new SCNVector3();
-        if (_characterNode?.GetBoundingBox(ref minimum, ref maximum) == true)
-        {
-            float x = MathF.Max(MathF.Abs(minimum.X), MathF.Abs(maximum.X));
-            float z = MathF.Max(MathF.Abs(minimum.Z), MathF.Abs(maximum.Z));
-            radius = MathF.Max(radius, MathF.Sqrt(x * x + z * z) + 0.02f);
-        }
+        float radius = CharacterFootRadius();
         if (!float.IsFinite(radius))
         { reason = "模型尺寸异常，暂不能进行路线移动。"; return false; }
-        int steps = Math.Max(1, (int)Math.Ceiling((target - start).Length / 0.07));
-        for (int step = 0; step <= steps; step++)
-        {
-            var point = start + (target - start) * (step / (float)steps);
-            if (!plane.ContainsWithMargin(point, radius))
-            { reason = "路线靠近扫描边界，请选更靠里面的目标，或继续扫描。"; return false; }
-        }
+        if (!ActivitySegmentAllowed(start, target, radius, autonomous, out reason)) return false;
+        if (!plane.SegmentWithMargin(start, target, radius))
+        { reason = "路线靠近扫描边界，请选更靠里面的目标，或继续扫描。"; return false; }
         if (_meshes.Count == 0 || _meshBounds.Count != _meshes.Count || _meshBounds.Values.Any(value => value.Length == 0))
         { reason = "LiDAR 网格还不完整，请扫描角色与目标之间的区域。"; return false; }
         foreach (var bounds in _meshBounds.Values.SelectMany(value => value))
@@ -523,6 +545,8 @@ public sealed class VisionViewController : UIViewController
         ++_motionGeneration;
         bool wasMoving = _moving;
         _moving = false;
+        _movingDestination = null;
+        _movingAutonomously = false;
         if (_characterNode is not null)
         {
             if (wasMoving) _characterNode.Position = _characterNode.PresentationNode.Position;
@@ -534,11 +558,13 @@ public sealed class VisionViewController : UIViewController
     private void Tick()
     {
         if (!_running || _disposed) return;
-        if (_moving && _characterNode is not null && _targetAnchorNode is not null &&
-            !CanMove(_characterNode.PresentationNode.WorldPosition, _targetAnchorNode.WorldPosition, out string reason))
+        if (_moving && _characterNode is not null && _movingDestination is { } destination &&
+            !CanMove(_characterNode.PresentationNode.WorldPosition, destination, out string reason, _movingAutonomously))
         {
             StopMotion(); _placementMessage = "已停下：" + reason; RefreshStatus();
+            StopAutonomy("路线条件改变，AI 已暂停。");
         }
+        AutonomyTick();
         if (!_showDebug) return;
         using var frame = _sceneView.Session.CurrentFrame;
         if (frame is null) { _diagnosticLabel.Text = "正在等待相机帧…"; return; }
@@ -548,7 +574,12 @@ public sealed class VisionViewController : UIViewController
 
     private void ShowMore()
     {
+        StopAutonomy("打开更多控制，AI 已暂停。"); StopMotion();
         var sheet = UIAlertController.Create("Alice · 空间伙伴", "0.1.0 · 本地 LiDAR 体验", UIAlertControllerStyle.ActionSheet);
+        sheet.AddAction(UIAlertAction.Create("AI 模型与 API 设置", UIAlertActionStyle.Default, _ => OpenAiSettings()));
+        sheet.AddAction(UIAlertAction.Create("画活动区域（绿色）", UIAlertActionStyle.Default, _ => BeginZoneEditing(false)));
+        sheet.AddAction(UIAlertAction.Create("添加禁止区域（红色）", UIAlertActionStyle.Default, _ => BeginZoneEditing(true)));
+        sheet.AddAction(UIAlertAction.Create("清除活动 / 禁止区域", UIAlertActionStyle.Destructive, _ => ClearActivityZones()));
         sheet.AddAction(UIAlertAction.Create("重新扫描", UIAlertActionStyle.Default, _ => ResetSession()));
         sheet.AddAction(UIAlertAction.Create(_showDebug ? "隐藏调试数据" : "显示调试数据", UIAlertActionStyle.Default, _ =>
         {
@@ -581,12 +612,13 @@ public sealed class VisionViewController : UIViewController
             UIApplication.SharedApplication.OpenUrl(url, new UIApplicationOpenUrlOptions(), null);
         }));
         sheet.AddAction(UIAlertAction.Create("使用帮助 / 模型格式", UIAlertActionStyle.Default, _ => ShowNotice("让小伙伴进入房间",
-            "1. 缓慢扫描地面，点击蓝色区域放置。\n2. 再点同一平面选目标，在角色动作中确认移动。\n\n支持单文件 USDZ / DAE / OBJ / GLB / VRM，最多 80 MB；推荐含贴图的 USDZ。GLB / VRM 目前为基础静态展示，不含骨骼动画、表情或弹簧物理。外部纹理依赖不会自动打包。其他模型动画需要文件本身带有。\n\n移动只检查已扫描的同一平面与 LiDAR 网格，最多 1.5 米，会保守停下；目前没有寻路和 AI。画面仅在本机处理。")));
+            "1. 扫描地面，点击蓝色区域放置。\n2. 更多 → 画活动区域；可添加红色禁区。\n3. 配置支持图片的 API，明确启动 AI 后，它会周期观察并自行选择动作。红色急停随时终止。\n\n可自行导入单文件 USDZ / DAE / OBJ / GLB / VRM，最大 1 GiB；复杂模型仍可能超出手机内存。具备标准人形骨骼映射的 VRM 可使用识别到的骨骼动作；其他模型仍可显示，只开放可靠识别的动作/内置动画。外部贴图不会自动打包。\n\n移动只检查同一已扫描平面和 LiDAR 网格，每次最多 1.5 米；这是保守限位，不是完整寻路。AI 开启时会向你选择的 API 发送当前视图（含角色）；关闭、后台、重定位、改区域或导入模型即暂停，返回后不会自动恢复上传。")));
         PresentSheet(sheet, _moreButton);
     }
 
     private void ChangeHeight()
     {
+        StopAutonomy("正在调整大小，AI 已暂停。"); StopMotion();
         var alert = UIAlertController.Create("角色高度", "输入米数（0.15～0.8），默认 0.35。", UIAlertControllerStyle.Alert);
         alert.AddTextField(field => { field.Text = _height.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture); field.KeyboardType = UIKeyboardType.DecimalPad; });
         alert.AddAction(UIAlertAction.Create("取消", UIAlertActionStyle.Cancel, null));
@@ -611,6 +643,7 @@ public sealed class VisionViewController : UIViewController
 
     private void ImportCharacter()
     {
+        StopAutonomy("正在导入模型，AI 已暂停。");
         StopMotion(); CancelImport();
 #pragma warning disable CA1422
         var picker = new UIDocumentPickerViewController(new[] {
@@ -650,8 +683,8 @@ public sealed class VisionViewController : UIViewController
             string extension = Path.GetExtension(source).ToLowerInvariant();
             if (!CharacterImporter.AllowedExtensions.Contains(extension))
                 throw new InvalidOperationException("请选择 USDZ、DAE、OBJ、GLB 或 VRM 文件。");
-            if (new FileInfo(source).Length > MaximumModelBytes)
-                throw new InvalidOperationException("文件超过 80 MB，请先压缩模型和贴图。");
+            if (new FileInfo(source).Length > CharacterImporter.MaximumFileBytes)
+                throw new InvalidOperationException("文件超过 1 GiB，请先压缩模型和贴图。");
             string filename = new string(Path.GetFileNameWithoutExtension(source)
                 .Where(character => char.IsLetterOrDigit(character) || character is '_' or '-').Take(64).ToArray());
             if (filename.Length == 0) filename = "Character";
@@ -670,7 +703,7 @@ public sealed class VisionViewController : UIViewController
                 while ((read = await input.ReadAsync(buffer, cancellation)) != 0)
                 {
                     total += read;
-                    if (total > MaximumModelBytes) throw new InvalidOperationException("文件超过 80 MB。");
+                    if (total > CharacterImporter.MaximumFileBytes) throw new InvalidOperationException("文件超过 1 GiB。");
                     await output.WriteAsync(buffer.AsMemory(0, read), cancellation);
                 }
             }, cancellation);
@@ -739,7 +772,7 @@ public sealed class VisionViewController : UIViewController
         BeginInvokeOnMainThread(() =>
         {
             if (_disposed || !_running || epoch != Interlocked.Read(ref _sessionGeneration)) return;
-            if (state != ARTrackingState.Normal) StopMotion();
+            if (state != ARTrackingState.Normal) { StopMotion(); StopAutonomy("追踪不稳定，AI 已暂停。"); }
             _trackingMessage = state switch
             {
                 ARTrackingState.Normal => "空间追踪稳定 · LiDAR 已接入",
@@ -764,6 +797,7 @@ public sealed class VisionViewController : UIViewController
             if (remove)
             {
                 _planes.Remove(identifier); _planeSurfaces.Remove(identifier);
+                if (_activityArea?.PlaneId == identifier) ClearActivityZones();
                 if (_characterPlaneId == identifier || _targetPlaneId == identifier)
                 {
                     StopMotion();
@@ -813,6 +847,7 @@ public sealed class VisionViewController : UIViewController
             if (_disposed || !_running || epoch != Interlocked.Read(ref _sessionGeneration)) return;
             if (_characterAnchor?.Identifier.AsString() == identifier)
             {
+                StopAutonomy("角色锚点丢失，AI 已暂停。");
                 StopMotion(); _characterNode = null; _characterAnchorNode = null;
                 _characterAnchor?.Dispose(); _characterAnchor = null; _characterPlaneId = null;
                 ClearTarget(); _placementMessage = "角色锚点已丢失，请重新点击蓝色区域放置。";
@@ -831,7 +866,7 @@ public sealed class VisionViewController : UIViewController
         BeginInvokeOnMainThread(() =>
         {
             if (_disposed || !_running || epoch != Interlocked.Read(ref _sessionGeneration)) return;
-            StopMotion(); CancelImport();
+            StopAutonomy("相机被中断，AI 已暂停。"); StopMotion(); CancelImport();
             _trackingMessage = ended ? "中断结束，正在重新定位…" : "相机被系统中断";
             RefreshStatus();
             if (ended && _visible) RunSession(false);
@@ -853,6 +888,7 @@ public sealed class VisionViewController : UIViewController
         _status.Text = "Alice · 空间伙伴\n" + _trackingMessage;
         _characterLabel.Text = _asset.DisplayName + $" · {_height:0.00} 米";
         _instruction.Text = _placementMessage;
+        RefreshCompanionStatus();
     }
 
     protected override void Dispose(bool disposing)
@@ -860,6 +896,7 @@ public sealed class VisionViewController : UIViewController
         if (disposing && !_disposed)
         {
             PauseSession(); _disposed = true; _visible = false;
+            DisposeCompanionControls();
             _backgroundObserver?.Dispose(); _activeObserver?.Dispose();
             _sceneView.Delegate = null; _sceneDelegate?.Dispose();
             _characterAnchor?.Dispose(); _targetAnchor?.Dispose(); _asset.Dispose();
@@ -871,6 +908,14 @@ public sealed class VisionViewController : UIViewController
 
     private sealed class PlaneSurface(SCNVector3[] boundary)
     {
+        private readonly System.Numerics.Vector2[] _boundary2D = boundary.Select(point =>
+            new System.Numerics.Vector2(point.X, point.Z)).ToArray();
+
+        public bool SegmentWithMargin(SCNVector3 start, SCNVector3 end, float radius) =>
+            ContainsWithMargin(start, radius) && ContainsWithMargin(end, radius) &&
+            AliceVision.Core.Spatial.ActivityArea.SegmentInsideSupportBoundary(_boundary2D,
+                new System.Numerics.Vector2(start.X, start.Z), new System.Numerics.Vector2(end.X, end.Z), radius);
+
         public bool ContainsWithMargin(SCNVector3 point, float radius)
         {
             if (boundary.Length < 3 || !float.IsFinite(radius) || radius < 0 ||

@@ -15,7 +15,7 @@ public static class CharacterFactory
 
     public static CharacterAsset CreateDefault() => new(
         "小光 · 原创空间伙伴",
-        "内置原创低多边形角色，支持关节挥手、原地迈步与待机。无需下载模型。",
+        "内置原创低多边形角色，支持左右挥手、招呼、欢迎、点头、鞠躬、舞动和原地迈步。无需下载模型。",
         BuildRig);
 
     private static SCNNode BuildRig()
