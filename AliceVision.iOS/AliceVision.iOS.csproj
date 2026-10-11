@@ -6,8 +6,8 @@
     <RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
     <ApplicationId>com.projectalice.vision</ApplicationId>
     <ApplicationTitle>Alice·空间伙伴</ApplicationTitle>
-    <ApplicationVersion>9</ApplicationVersion>
-    <ApplicationDisplayVersion>0.2.4</ApplicationDisplayVersion>
+    <ApplicationVersion>10</ApplicationVersion>
+    <ApplicationDisplayVersion>0.2.5</ApplicationDisplayVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

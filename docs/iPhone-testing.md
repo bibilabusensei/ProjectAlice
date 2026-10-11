@@ -20,6 +20,8 @@
 - 小光与自己的模型：贴图、初始姿态、脚底、高度、朝向；招手应驱动手臂，而不是整个模型旋转。
 - 0.2.3 请重新导入之前出现拉长三角形的 VRM，检查待机及招手时网格不飞散，眼睛/面部/衣服的图集区域与原模型一致。
 - 0.2.4 检查发光装饰的颜色与纹理；若模型材质元数据已另存修正副本，请导入副本，检查透明眼睛和高光不再遮住瞳孔、衣服使用颜色图而不是阴影遮罩。
+- 0.2.5 请重点录屏左右招手：手臂只抬起一次、肘部自然弯曲、掌心朝前，主要左右摆手腕而不是上下摆整条手臂，结束时平滑放下。
+- 先招手、再点头/待机，以及招手中途急停：观察是否突然跳姿、肘关节反折或左右手不对称。待机应是微弱呼吸/重心变化，不是同步左右摇头。
 - 左右招手、欢迎、点头、鞠躬、舞动；连续切动作与急停后是否恢复初始姿态。
 - 导入取消、错误格式、无网格、损坏文件、超过 1 GB 或超几何/纹理预算：应保留原角色而不是崩溃。
 - 调整高度、转身、恢复内置角色、重新扫描；导入角色不应偷偷播放动画。
@@ -51,12 +53,14 @@ iOS 完整版本：
 dotnet run --project AliceVision.Tests/AliceVision.Tests.csproj --configuration Release
 dotnet run --project AliceVision.ModelTests/AliceVision.ModelTests.csproj --configuration Release
 dotnet run --project AliceVision.AgentTests/AliceVision.AgentTests.csproj --configuration Release
+dotnet run --project AliceVision.MotionTests/AliceVision.MotionTests.csproj --configuration Release
 dotnet run --project AliceVision.ModelTests/AliceVision.ModelTests.csproj -- --inspect-model "你的模型.vrm"
 pwsh -File scripts/check-ios-transforms.ps1
 ```
 
 Windows 的模型解析/测试成功不等于手机材质渲染成功。iPhone 原生包由 GitHub Actions 构建。
-安装 iOS workload 后，矩阵脚本会编译生产转换代码并执行实际 iOS 实现程序集的纯托管矩阵布局检查；
+动作测试覆盖曲线端点、缓入缓出、左右镜像、不同初始手臂姿态和两骨长度约束；只能验证数学与时序，不保证每个模型看起来像真人。
+安装 iOS workload 后，矩阵脚本会编译生产转换代码并执行实际 iOS 实现程序集的纯托管矩阵布局、四元数桥接与父子旋转组合检查；
 不创建 UIKit 对象或调用原生设备接口，不能替代 iPhone 图像渲染测试。
 `ProjectAlice.sln` 保留旧 Windows / Android 工程；iPhone 使用 `ProjectAlice.iOS.sln`。
 不修改 `lingdongdao` 或其他无关工程。当前尚不能在本机验证用户报告的 iOS 27。

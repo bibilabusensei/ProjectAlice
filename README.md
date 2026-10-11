@@ -1,6 +1,6 @@
 # Project Alice
 
-## 当前优先：Alice·空间伙伴 0.2.4（iPhone LiDAR）
+## 当前优先：Alice·空间伙伴 0.2.5（iPhone LiDAR）
 
 现在优先开发 `AliceVision.iOS`：原生 ARKit 后置相机预览、水平面、LiDAR 场景网格与深度、
 真实物体遮挡、角色导入与骨骼动作、视觉 API、自主活动区与禁区。目标测试设备为 iPhone 15 Pro。
@@ -17,6 +17,8 @@ GLB / VRM 贴图保留原始分辨率、不自动缩小或重压缩；按需逐�
 GLB / VRM 保留皮肤与骨骼绑定，具有标准 VRM 人形映射的模型可做程序化招手、欢迎、点头、鞠躬、舞动和迈步。
 0.2.3 修复原生矩阵行/列转换导致的拉长网格与蒙皮错位，统一绑定空间；贴图坐标保留原始 UV，不再额外翻转 V。
 0.2.4 补充 glTF 发光颜色与贴图支持，并把基础颜色乘数限定到漫反射通道，避免错误染色发光层。
+0.2.5 按实际人形骨骼的手臂长度和初始方向校准两骨 IK：先抬手、弯肘、掌心朝前，再左右摆手腕，最后平滑放下；不再上下泵动肩膀。
+切换动作使用平滑过渡，待机使用微弱、不同步的连续呼吸和重心变化。这仍是程序化动作，不是动作捕捉；自然程度需要真机观察。
 模型导出时若把阴影遮罩接到颜色通道、或漏写眼睛透明模式，应用不会擅自猜测修改；须另存修正模型的材质元数据。
 复杂模型的单个蒙皮绑定现在支持最多 1024 根骨骼（原上限 256）；保留 UInt16 索引、原始网格与有效权重。
 GLB/VRM 几何安全上限提升为 200 万顶点、400 万三角形；读取网格数组前先估算内存，逐步检查原画质贴图、骨骼和 GPU 开销，不自动减面。
@@ -89,6 +91,7 @@ AliceVision/            Windows 控制台冒烟测试入口
 dotnet run --project .\AliceVision.Tests\AliceVision.Tests.csproj --configuration Release
 dotnet run --project .\AliceVision.ModelTests\AliceVision.ModelTests.csproj --configuration Release
 dotnet run --project .\AliceVision.AgentTests\AliceVision.AgentTests.csproj --configuration Release
+dotnet run --project .\AliceVision.MotionTests\AliceVision.MotionTests.csproj --configuration Release
 dotnet build .\ProjectAlice.sln --configuration Debug
 ```
 

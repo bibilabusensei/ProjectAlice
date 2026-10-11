@@ -21,7 +21,9 @@ VRM0 的 -Z 前向与 VRM1 的 +Z 前向在渲染时统一为 +Z，网格和骨�
 蒙皮使用共同模型根作为绑定空间，保留原骨骼层级和绑定矩阵；iOS UIImage 贴图直接使用原始 UV，不执行额外 V 翻转。
 矩阵布局依据 [官方 .NET SceneKit 实现](https://github.com/dotnet/macios/blob/main/src/SceneKit/SCNMatrix4_dotnet.cs)；
 UV 行为对照 [glTF 规范](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#images)及 [SceneKit glTF 加载器](https://github.com/magicien/GLTFSceneKit/blob/master/Sources/GLTFSceneKit/GLTFUnarchiver.swift)。
-这是程序化动作，不是动作捕捉、复杂动作生成或完整 IK，效果取决于骨骼布局和权重。请用你自己准备的模型测试。
+从 0.2.5 起，招呼按实际手臂长度和绑定姿态校准两骨 IK，掌心方向由手/指骨辅助识别；抬手、弯肘、左右摆手腕、放手分阶段平滑执行。
+切换动作带缓入缓出，待机只有轻微的连续呼吸和重心变化。缺少必要骨骼时保守回退，不通过硬套某个角色的角度驱动。
+这是程序化动作和手臂 IK，不是动作捕捉、复杂动作生成或全身 IK；效果取决于骨骼布局和权重，真实自然程度仍需用自己的模型真机测试。
 
 ## 材质诊断与无损副本修正
 

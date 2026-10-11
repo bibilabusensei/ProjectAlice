@@ -9,6 +9,7 @@ on:
       - 'AliceVision.Tests/**'
       - 'AliceVision.ModelTests/**'
       - 'AliceVision.AgentTests/**'
+      - 'AliceVision.MotionTests/**'
       - 'scripts/**'
       - '.github/workflows/ios-ipa.yml'
   workflow_dispatch:
@@ -26,7 +27,7 @@ env:
 
 jobs:
   core-tests:
-    name: Test shared camera geometry and algorithms
+    name: Test shared algorithms, model import and humanoid motion
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -42,6 +43,8 @@ jobs:
         run: dotnet run --project AliceVision.ModelTests/AliceVision.ModelTests.csproj --configuration Release
       - name: Run offline AI protocol and activity-zone safety tests
         run: dotnet run --project AliceVision.AgentTests/AliceVision.AgentTests.csproj --configuration Release
+      - name: Run humanoid motion timing and two-bone pose tests
+        run: dotnet run --project AliceVision.MotionTests/AliceVision.MotionTests.csproj --configuration Release
       - name: Test IPA publication guards
         run: python3 scripts/test-verify-ipa.py
       - name: Test lossless material-copy repair guards

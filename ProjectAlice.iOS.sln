@@ -12,12 +12,18 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AliceVision.ModelTests", "A
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AliceVision.AgentTests", "AliceVision.AgentTests\AliceVision.AgentTests.csproj", "{6A98E3CA-F96A-43D5-868A-40149505BCA9}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AliceVision.MotionTests", "AliceVision.MotionTests\AliceVision.MotionTests.csproj", "{94F0AA73-340F-4178-BC1F-9A0E0506C8EB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{94F0AA73-340F-4178-BC1F-9A0E0506C8EB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{94F0AA73-340F-4178-BC1F-9A0E0506C8EB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{94F0AA73-340F-4178-BC1F-9A0E0506C8EB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{94F0AA73-340F-4178-BC1F-9A0E0506C8EB}.Release|Any CPU.Build.0 = Release|Any CPU
 		{6A98E3CA-F96A-43D5-868A-40149505BCA9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{6A98E3CA-F96A-43D5-868A-40149505BCA9}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{6A98E3CA-F96A-43D5-868A-40149505BCA9}.Release|Any CPU.ActiveCfg = Release|Any CPU

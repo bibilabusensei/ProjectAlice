@@ -17,6 +17,7 @@ namespace AliceVision.iOS;
 public sealed partial class VisionViewController : UIViewController
 {
     private const string MoveActionKey = "Alice.Companion.Move";
+    private const string TurnActionKey = "Alice.Companion.Turn";
     private readonly ARSCNView _sceneView = new();
     private readonly UILabel _status = new(), _diagnosticLabel = new(), _characterLabel = new(), _instruction = new();
     private readonly UIView _panel = new();
@@ -438,8 +439,18 @@ public sealed partial class VisionViewController : UIViewController
         if (cameraNode is null) return;
         var camera = _characterAnchorNode.ConvertPositionFromNode(cameraNode.WorldPosition, null);
         var delta = camera - _characterNode.Position;
-        _characterNode.EulerAngles = new SCNVector3(0, MathF.Atan2(delta.X, delta.Z), 0);
+        TurnTowards(delta);
+        CharacterMotion.Play(_asset, _characterNode, "idle");
         _placementMessage = "小伙伴正看向你。"; RefreshStatus();
+    }
+
+    private void TurnTowards(SCNVector3 direction)
+    {
+        if (_characterNode is null || !float.IsFinite(direction.X) || !float.IsFinite(direction.Z) ||
+            direction.X * direction.X + direction.Z * direction.Z < 0.000001f) return;
+        var turn = SCNAction.RotateTo(0, MathF.Atan2(direction.X, direction.Z), 0, 0.65, true);
+        turn.TimingMode = SCNActionTimingMode.EaseInEaseOut;
+        _characterNode.RunAction(turn, TurnActionKey);
     }
 
     private void MoveToTarget()
@@ -469,8 +480,8 @@ public sealed partial class VisionViewController : UIViewController
         _movingAutonomously = autonomous;
         var localTarget = _characterAnchorNode.ConvertPositionFromNode(target, null);
         var delta = localTarget - _characterNode.Position;
-        _characterNode.EulerAngles = new SCNVector3(0, MathF.Atan2(delta.X, delta.Z), 0);
         bool hasWalk = CharacterMotion.Play(_asset, _characterNode, "walk");
+        TurnTowards(delta);
         double duration = Math.Max(0.6, (target - start).Length / 0.28);
         var action = SCNAction.MoveTo(localTarget, duration);
         _characterNode.RunAction(action, MoveActionKey, () => BeginInvokeOnMainThread(() =>

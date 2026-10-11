@@ -11,7 +11,7 @@ if ($LASTEXITCODE -ne 0 -or $remote -ne 'https://github.com/bibilabusensei/Proje
     throw 'Unexpected publish repository; refusing to copy files'
 }
 $files = @('.gitattributes', '.gitignore', 'README.md', 'ProjectAlice.sln', 'ProjectAlice.iOS.sln')
-foreach ($directory in @('AliceVision', 'AliceVision.Core', 'AliceVision.Tests', 'AliceVision.ModelTests', 'AliceVision.AgentTests', 'AliceVision.iOS', 'AliceVision.Android', '.github', 'scripts', 'docs')) {
+foreach ($directory in @('AliceVision', 'AliceVision.Core', 'AliceVision.Tests', 'AliceVision.ModelTests', 'AliceVision.AgentTests', 'AliceVision.MotionTests', 'AliceVision.iOS', 'AliceVision.Android', '.github', 'scripts', 'docs')) {
     $files += @(& rg --files --hidden (Join-Path $sourceRoot $directory) -g '!**/bin/**' -g '!**/obj/**' -g '!**/__pycache__/**' | ForEach-Object {
         [IO.Path]::GetRelativePath($sourceRoot, $_)
     })
