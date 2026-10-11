@@ -23,6 +23,8 @@ internal static class CharacterGltfImporter
     {
         GltfDocument document = GltfDocument.Load(localPath);
         var root = new SCNNode { Name = RigRoot };
+        var content = new SCNNode { Name = "AliceVision.AvatarCoordinates", Transform = ToSceneMatrix(document.AvatarBasis) };
+        root.AddChildNode(content);
         var selectedNodes = new HashSet<int>();
         var pendingNodes = new Stack<int>(document.Roots);
         while (pendingNodes.TryPop(out int index))
@@ -104,7 +106,7 @@ internal static class CharacterGltfImporter
                         using var skinner = SCNSkinner.Create(geometry, binding.Joints.Select(index => nodes[index]).ToArray(),
                             binding.InverseBindMatrices.Select(ToSceneMatrix).ToArray(), weights, indices);
                         skinner.BaseGeometryBindTransform = SCNMatrix4.Identity;
-                        skinner.Skeleton = binding.Skeleton >= 0 ? nodes[binding.Skeleton] : root;
+                        skinner.Skeleton = binding.Skeleton >= 0 ? nodes[binding.Skeleton] : content;
                         mesh.Skinner = skinner;
                         mesh.Name = "AliceVision.SkinnedMesh";
                         var minimum = new SCNVector3(binding.RestBoundsMinimum.X, binding.RestBoundsMinimum.Y, binding.RestBoundsMinimum.Z);
@@ -114,14 +116,14 @@ internal static class CharacterGltfImporter
                         // transform: jointWorld * inverseBind places its vertices.
                         // An identity child of the common content root implements
                         // that rule while retaining the original joint hierarchy.
-                        root.AddChildNode(mesh);
+                        content.AddChildNode(mesh);
                     }
                     else nodes[i].AddChildNode(mesh);
                 }
             }
             for (int i = 0; i < nodes.Length; i++)
                 foreach (int child in document.Nodes[i].Children) nodes[i].AddChildNode(nodes[child]);
-            foreach (int index in document.Roots) root.AddChildNode(nodes[index]);
+            foreach (int index in document.Roots) content.AddChildNode(nodes[index]);
             // SceneKit retains child nodes, geometries, materials and image contents.
             foreach (SCNNode node in nodes) node.Dispose();
             return root;

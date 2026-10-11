@@ -29,11 +29,12 @@ public sealed class GltfDocument
     public const long MaximumTotalImagePixels = 64L * 1024 * 1024;
     private GltfDocument(GltfNode[] nodes, int[] roots, GltfImage[] images, GltfTexture[] textures,
         GltfMaterial[] materials, bool hasSkin, bool hasMorphs, bool hasAnimations,
-        IReadOnlyDictionary<string, int> humanBones)
+        IReadOnlyDictionary<string, int> humanBones, bool legacyVrm)
     {
         Nodes = nodes; Roots = roots; Images = images; Textures = textures; Materials = materials;
         HasSkin = hasSkin; HasMorphs = hasMorphs; HasAnimations = hasAnimations;
         HumanBones = humanBones;
+        IsLegacyVrm = legacyVrm;
     }
     public IReadOnlyList<GltfNode> Nodes { get; }
     public IReadOnlyList<int> Roots { get; }
@@ -44,6 +45,9 @@ public sealed class GltfDocument
     public bool HasMorphs { get; }
     public bool HasAnimations { get; }
     public IReadOnlyDictionary<string, int> HumanBones { get; }
+    public bool IsLegacyVrm { get; }
+    // VRM0 is -Z forward; VRM1 is +Z forward. Raw mesh/skin data stay untouched.
+    public Matrix4x4 AvatarBasis => IsLegacyVrm ? Matrix4x4.CreateRotationY(MathF.PI) : Matrix4x4.Identity;
 
     public static GltfDocument Load(string path)
     {
@@ -173,8 +177,10 @@ public sealed class GltfDocument
                     if (primitive.Skin is { } skin && (skin.Joints.Any(joint => !visibleNodes.Contains(joint)) ||
                         (skin.Skeleton >= 0 && !visibleNodes.Contains(skin.Skeleton))))
                         throw Invalid("蒙皮骨骼必须包含在当前场景层级内。");
+            var humanBones = ReadHumanBones(visibleNodes);
+            bool legacyVrm = _root.TryGetProperty("extensions", out var extensions) && extensions.TryGetProperty("VRM", out _);
             return new GltfDocument(nodes, roots, images, textures, materials, _rawSkins.Length > 0,
-                _hasMorphs, Array(_root, "animations", 256).Length > 0, ReadHumanBones(visibleNodes));
+                _hasMorphs, Array(_root, "animations", 256).Length > 0, humanBones, legacyVrm);
         }
 
         private static void ValidateJson(JsonElement element, ref int remaining)

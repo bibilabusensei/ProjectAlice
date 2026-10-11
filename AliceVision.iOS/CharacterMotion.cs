@@ -236,13 +236,18 @@ public static class CharacterMotion
             {
                 if (!nodes.TryGetValue(side + "UpperArm", out var upper)) return 0;
                 var direction = new SCNVector3(0, -1, 0);
+                var start = body.ConvertPositionFromNode(upper.WorldPosition, null);
                 if (nodes.TryGetValue(side + "LowerArm", out var lower))
                 {
-                    var start = body.ConvertPositionFromNode(upper.WorldPosition, null);
                     var end = body.ConvertPositionFromNode(lower.WorldPosition, null);
                     direction = end - start;
                 }
-                float angle = MathF.Atan2(y, x) - MathF.Atan2(direction.Y, direction.X);
+                var center = nodes.TryGetValue("spine", out var spine)
+                    ? body.ConvertPositionFromNode(spine.WorldPosition, null) : new SCNVector3();
+                float outward = MathF.Abs(start.X - center.X) > 0.00001f ? MathF.Sign(start.X - center.X)
+                    : MathF.Abs(direction.X) > 0.00001f ? MathF.Sign(direction.X) : MathF.Sign(x);
+                // Determine the arm's outward side from this avatar, not a naming convention.
+                float angle = MathF.Atan2(y, outward * MathF.Abs(x)) - MathF.Atan2(direction.Y, direction.X);
                 while (angle > MathF.PI) angle -= 2 * MathF.PI;
                 while (angle < -MathF.PI) angle += 2 * MathF.PI;
                 return angle;

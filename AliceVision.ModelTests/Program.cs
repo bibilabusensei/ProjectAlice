@@ -148,9 +148,14 @@ static void ValidatesHumanBones()
 {
     var (json, binary) = SkinnedTriangle();
     json["extensions"] = JsonNode.Parse("{\"VRM\":{\"humanoid\":{\"humanBones\":[{\"bone\":\"head\",\"node\":1}]}}}");
-    Assert(GltfDocument.Parse(Encode(json, binary)).HumanBones["head"] == 1, "VRM0 humanBones map lost.");
+    var legacy = GltfDocument.Parse(Encode(json, binary));
+    Assert(legacy.HumanBones["head"] == 1 && legacy.IsLegacyVrm, "VRM0 humanBones/version lost.");
+    Assert(Vector3.Distance(Vector3.Transform(-Vector3.UnitZ, legacy.AvatarBasis), Vector3.UnitZ) < 0.00001f,
+        "Legacy avatar must be normalized to +Z forward, including meshes and joints together.");
     json["extensions"] = JsonNode.Parse("{\"VRMC_vrm\":{\"humanoid\":{\"humanBones\":{\"head\":{\"node\":1}}}}}");
-    Assert(GltfDocument.Parse(Encode(json, binary)).HumanBones["head"] == 1, "VRM1 humanBones map lost.");
+    var modern = GltfDocument.Parse(Encode(json, binary));
+    Assert(modern.HumanBones["head"] == 1 && !modern.IsLegacyVrm && modern.AvatarBasis == Matrix4x4.Identity,
+        "VRM1 must preserve its +Z convention.");
     json["extensions"]!["VRMC_vrm"]!["humanoid"]!["humanBones"]!["head"]!["node"] = 42;
     Reject(Encode(json, binary));
     json["extensions"] = JsonNode.Parse("{\"VRM\":{\"humanoid\":{\"humanBones\":[{\"bone\":\"head\",\"node\":1},{\"bone\":\"hips\",\"node\":1}]}}}");
