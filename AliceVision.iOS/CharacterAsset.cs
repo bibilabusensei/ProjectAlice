@@ -186,7 +186,29 @@ public sealed class CharacterAsset : IDisposable
         if (!_disposed)
         {
             _disposed = true;
-            _prototype?.Dispose();
+            if (_prototype is not null) DisposeNode(_prototype);
+        }
+    }
+
+    /// <summary>Final ownership release; do not clear shared material contents.</summary>
+    internal static void DisposeNode(SCNNode root)
+    {
+        if (root.Handle == IntPtr.Zero) return;
+        CharacterMotion.Forget(root);
+        var nodes = CharacterMotion.Enumerate(root).ToArray();
+        foreach (var node in nodes)
+        {
+            node.RemoveAllActions();
+            node.RemoveAllAnimations();
+            // A clone can share geometry/materials with a surviving prototype.
+            // Detach this node's references only; never mutate those resources.
+            node.Skinner = null;
+            node.Geometry = null;
+        }
+        foreach (var node in nodes.Reverse())
+        {
+            node.RemoveFromParentNode();
+            node.Dispose();
         }
     }
 }

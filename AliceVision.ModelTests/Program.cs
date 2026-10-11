@@ -71,7 +71,16 @@ var tests = new (string Name, Action Body)[]
     ("rejects sparse accessors", RejectsSparseAccessors),
     ("rejects bad skin indices weights and matrices", RejectsInvalidSkin),
     ("rejects oversized and corrupt image dimensions", RejectsImageBombs),
-    ("accepts bounded multiple4MP metadata and rejects total decode budget", BoundsTextureSet),
+    ("accepts 5 10 and 64 original-resolution 4K image metadata", AcceptsLargeTextureSets),
+    ("accepts full 8K metadata but rejects image count and dimension bombs", BoundsTextureMetadata),
+    ("reads original texture bytes lazily after the parsing stream closes", PreservesLazyTextureBytes),
+    ("refuses lazy texture reads after source timestamp or length changes", RejectsChangedTextureSource),
+    ("bounds metadata allocation independently of encoded image size", BoundsImageMetadataAllocation),
+    ("rejects per-image and total encoded texture limits before allocation", BoundsEncodedTextureBytes),
+    ("estimates original resolution CPU GPU mips and decode scratch", EstimatesTextureMemory),
+    ("retains 8-bit and 16-bit precision in metadata memory estimates", EstimatesTexturePrecision),
+    ("ignores unreferenced images when estimating chosen textures", EstimatesReferencedTextures),
+    ("rejects malformed memory estimator inputs", RejectsTextureMemoryInputs),
     ("rejects duplicate JSON keys and external scenes", RejectsDuplicateKeys)
 };
 int failures = 0;
@@ -411,20 +420,216 @@ static void RejectsDuplicateKeys()
     Reject(Encode(json, binary));
 }
 
-static void BoundsTextureSet()
+static void AcceptsLargeTextureSets()
 {
     var (json, binary) = TexturedTriangle();
-    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 2048);
-    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 20, 4), 2048);
-    // This test exercises header budgets, not native PNG decoding. Each reference
-    // is counted because the importer could create a separate decoded image.
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 4096);
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 20, 4), 4096);
+    // These are metadata-only fixtures, not full 4K encoded PNGs. Rendering tests
+    // require a real device; metadata must not reject 5+ original 4K images.
     var images = new JsonArray();
-    for (int i = 0; i < 11; i++) images.Add(json["images"]![0]!.DeepClone());
+    JsonNode image = json["images"]![0]!.DeepClone();
     json["images"] = images;
-    Assert(GltfDocument.Parse(Encode(json, binary)).Images.Count == 11, "A bounded 4MP texture set was rejected.");
-    while (images.Count < 17) images.Add(images[0]!.DeepClone());
+    foreach (int target in new[] { 5, 10, 64 })
+    {
+        while (images.Count < target) images.Add(image.DeepClone());
+        var parsed = GltfDocument.Parse(Encode(json, binary));
+        Assert(parsed.Images.Count == target && parsed.Images.All(texture => texture.Width == 4096 && texture.Height == 4096),
+            "4K metadata was rejected or silently reduced.");
+    }
+}
+
+static void BoundsTextureMetadata()
+{
+    var (json, binary) = TexturedTriangle();
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 8192);
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 20, 4), 8192);
+    Assert(GltfDocument.Parse(Encode(json, binary)).Images[0].Width == 8192, "Exact 8K boundary must retain original dimensions.");
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 8193);
+    Reject(Encode(json, binary));
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 0);
+    Reject(Encode(json, binary));
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), uint.MaxValue);
+    Reject(Encode(json, binary));
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 1);
+    var images = new JsonArray();
+    for (int i = 0; i < 65; i++) images.Add(json["images"]![0]!.DeepClone());
+    json["images"] = images;
     Reject(Encode(json, binary));
 }
+
+static void PreservesLazyTextureBytes()
+{
+    var (json, binary) = TexturedTriangle();
+    string path = TemporaryModelPath();
+    try
+    {
+        WriteSparseGlb(path, json, binary, (binary.Length + 3) & ~3);
+        GltfDocument result = GltfDocument.Load(path);
+        byte[] expected = binary[44..];
+        Assert(result.Images[0].EncodedByteLength == expected.Length, "Encoded texture length changed.");
+        byte[] first = result.Images[0].ReadEncodedBytes();
+        Assert(first.SequenceEqual(expected), "Disk lazy reader changed original bytes.");
+        first[0] = 0;
+        Assert(result.Images[0].ReadEncodedBytes().SequenceEqual(expected), "Lazy reader must not retain a mutable encoded cache.");
+        GltfDocument memory = GltfDocument.Parse(Encode(json, binary));
+        Assert(memory.Images[0].ReadEncodedBytes().SequenceEqual(expected), "Memory source changed original bytes.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void RejectsChangedTextureSource()
+{
+    foreach (bool changeLength in new[] { false, true })
+    {
+        var (json, binary) = TexturedTriangle();
+        string path = TemporaryModelPath();
+        try
+        {
+            WriteSparseGlb(path, json, binary, (binary.Length + 3) & ~3);
+            GltfDocument result = GltfDocument.Load(path);
+            if (changeLength)
+            {
+                using var file = new FileStream(path, FileMode.Open, FileAccess.Write);
+                file.SetLength(file.Length + 4);
+            }
+            else File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddMinutes(2));
+            bool rejected = false;
+            try { _ = result.Images[0].ReadEncodedBytes(); } catch (InvalidDataException) { rejected = true; }
+            Assert(rejected, "Changed source must require reimport before texture allocation.");
+        }
+        finally { File.Delete(path); }
+    }
+}
+
+static void BoundsImageMetadataAllocation()
+{
+    var (json, binary) = TexturedTriangle();
+    json["bufferViews"]![2]!["byteLength"] = GltfDocument.MaximumEncodedImageBytes;
+    string path = TemporaryModelPath();
+    try
+    {
+        WriteSparseGlb(path, json, binary, GltfDocument.MaximumEncodedImageBytes + 44);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        GltfDocument result = GltfDocument.Load(path);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert(result.Images[0].EncodedByteLength == GltfDocument.MaximumEncodedImageBytes, "Exact 64 MiB encoded image boundary rejected.");
+        Assert(allocated < 2 * 1024 * 1024, "Metadata parsing retained or copied a whole encoded texture.");
+    }
+    finally { File.Delete(path); }
+}
+
+static void BoundsEncodedTextureBytes()
+{
+    foreach (bool totalLimit in new[] { false, true })
+    {
+        var (json, binary) = TexturedTriangle();
+        int imageLength = totalLimit ? GltfDocument.MaximumEncodedImageBytes : GltfDocument.MaximumEncodedImageBytes + 1;
+        json["bufferViews"]![2]!["byteLength"] = imageLength;
+        if (totalLimit)
+        {
+            var images = new JsonArray();
+            for (int i = 0; i < 9; i++) images.Add(json["images"]![0]!.DeepClone());
+            json["images"] = images;
+        }
+        string path = TemporaryModelPath();
+        try
+        {
+            WriteSparseGlb(path, json, binary, (imageLength + 44 + 3) & ~3);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool rejected = false;
+            try { _ = GltfDocument.Load(path); } catch (InvalidDataException) { rejected = true; }
+            Assert(rejected && GC.GetAllocatedBytesForCurrentThread() - before < 2 * 1024 * 1024,
+                "Encoded image limit must reject before reading large image data.");
+        }
+        finally { File.Delete(path); }
+    }
+}
+
+static void EstimatesTextureMemory()
+{
+    var image = new GltfImage(new byte[] { 1, 2, 3 }, "image/png", 4096, 4096);
+    long decoded = 4096L * 4096 * 8;
+    Assert(ModelTextureMemory.DecodedBytes(image) == decoded, "Full-resolution 16-bit decode estimate incorrect.");
+    long mipPixels = Enumerable.Range(0, 13).Sum(level => (long)(4096 >> level) * (4096 >> level));
+    long resident = decoded + mipPixels * 8 + image.EncodedByteLength;
+    Assert(ModelTextureMemory.TextureResidentBytes(image) == resident, "Original-size GPU mip chain not accounted for.");
+    Assert(ModelTextureMemory.Estimate(new[] { image }) == resident + decoded + 6 + ModelTextureMemory.GeometryReserveBytes,
+        "Decode scratch, encoded copies or geometry headroom missing.");
+    var narrow = new GltfImage(new byte[] { 1 }, "image/png", 1, 8192);
+    Assert(ModelTextureMemory.TextureResidentBytes(narrow) == 8192 * 8L + 16383 * 8L + narrow.EncodedByteLength,
+        "Narrow-texture mip chain must not rely on an unsafe 4/3 estimate.");
+    Assert(ModelTextureMemory.Estimate(Array.Empty<GltfImage>()) == ModelTextureMemory.GeometryReserveBytes,
+        "Geometry headroom missing for a textureless scene.");
+}
+
+static void EstimatesReferencedTextures()
+{
+    var (json, binary) = TexturedTriangle();
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 4096);
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 20, 4), 4096);
+    var images = new JsonArray();
+    for (int i = 0; i < 64; i++) images.Add(json["images"]![0]!.DeepClone());
+    json["images"] = images;
+    var result = GltfDocument.Parse(Encode(json, binary));
+    int imageIndex = result.Textures[result.Materials[0].Texture].Image;
+    long selected = ModelTextureMemory.Estimate(new[] { result.Images[imageIndex] });
+    Assert(selected == ModelTextureMemory.Estimate(new[] { result.Images[0] }), "Unreferenced thumbnails entered selected-image estimate.");
+    Assert(ModelTextureMemory.Estimate(result.Images) > selected * 32, "Texture memory must scale with actual selected images.");
+}
+
+static void EstimatesTexturePrecision()
+{
+    var (json, binary) = TexturedTriangle();
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 16, 4), 4096);
+    BinaryPrimitives.WriteUInt32BigEndian(binary.AsSpan(44 + 20, 4), 4096);
+    GltfImage ordinary = GltfDocument.Parse(Encode(json, binary)).Images[0];
+    Assert(ordinary.EstimatedDecodedBytesPerPixel == 4 && ModelTextureMemory.DecodedBytes(ordinary) == 64L * 1024 * 1024,
+        "Ordinary 4K textures must not be charged as 16-bit decoded textures.");
+    binary[44 + 24] = 16;
+    GltfImage deep = GltfDocument.Parse(Encode(json, binary)).Images[0];
+    Assert(deep.EstimatedDecodedBytesPerPixel == 8 && ModelTextureMemory.DecodedBytes(deep) == 128L * 1024 * 1024,
+        "High-depth 4K textures need twice the full-resolution decode budget.");
+    Assert(ModelTextureMemory.TextureResidentBytes(deep) - deep.EncodedByteLength ==
+        (ModelTextureMemory.TextureResidentBytes(ordinary) - ordinary.EncodedByteLength) * 2,
+        "Precision-aware GPU mip accounting inconsistent.");
+    binary[44 + 24] = 32;
+    Reject(Encode(json, binary));
+
+    var (jpegJson, original) = TexturedTriangle();
+    // Header-only JPEG fixtures exercise SOF metadata, never native decoding.
+    byte[] header = { 0xff, 0xd8, 0xff, 0xc0, 0, 11, 8, 0x10, 0, 0x10, 0, 1, 1, 0x11, 0, 0xff, 0xd9 };
+    byte[] jpegBinary = new byte[44 + header.Length];
+    original.AsSpan(0, 44).CopyTo(jpegBinary); header.CopyTo(jpegBinary, 44);
+    jpegJson["buffers"]![0]!["byteLength"] = jpegBinary.Length;
+    jpegJson["bufferViews"]![2]!["byteLength"] = header.Length;
+    jpegJson["images"]![0]!["mimeType"] = "image/jpeg";
+    GltfImage jpeg = GltfDocument.Parse(Encode(jpegJson, jpegBinary)).Images[0];
+    Assert(jpeg.Width == 4096 && jpeg.EstimatedDecodedBytesPerPixel == 4, "8-bit JPEG metadata estimate incorrect.");
+    jpegBinary[44 + 6] = 12;
+    Assert(GltfDocument.Parse(Encode(jpegJson, jpegBinary)).Images[0].EstimatedDecodedBytesPerPixel == 8,
+        "Higher-precision JPEG needs a safe decode estimate.");
+}
+
+static void RejectsTextureMemoryInputs()
+{
+    foreach ((int width, int height) in new[] { (0, 4096), (-1, 4096), (8193, 1), (int.MaxValue, int.MaxValue) })
+    {
+        bool rejected = false;
+        try { _ = new GltfImage(new byte[] { 1 }, "image/png", width, height); }
+        catch (InvalidDataException) { rejected = true; }
+        Assert(rejected, "Invalid dimensions must fail before estimator arithmetic.");
+    }
+    var image = new GltfImage(new byte[] { 1 }, "image/png", 1, 1);
+    bool excessiveCount = false;
+    try { _ = ModelTextureMemory.Estimate(Enumerable.Repeat(image, 65)); }
+    catch (InvalidDataException) { excessiveCount = true; }
+    Assert(excessiveCount, "Estimator must reject unbounded texture collections.");
+    long maximal = ModelTextureMemory.Estimate(Enumerable.Repeat(new GltfImage(new byte[] { 1 }, "image/png", 8192, 8192), 64));
+    Assert(maximal > 64L * 1024 * 1024 * 1024 && maximal < long.MaxValue, "Largest validated textures must not overflow memory arithmetic.");
+}
+
+static string TemporaryModelPath() => Path.Combine(Path.GetTempPath(), "AliceVision-texture-test-" + Guid.NewGuid().ToString("N") + ".glb");
 
 static (JsonObject Json, byte[] Binary) Triangle()
 {

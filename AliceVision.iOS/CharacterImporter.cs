@@ -19,6 +19,21 @@ public static class CharacterImporter
     public const long MaximumFileBytes = 1L << 30;
     public static IReadOnlyList<string> AllowedExtensions { get; } = new[] { ".usdz", ".dae", ".obj", ".glb", ".vrm" };
 
+    public static async Task<CharacterAsset> LoadAsync(string localPath, CancellationToken cancellation,
+        Action<string>? progress = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(localPath);
+        string path = Path.GetFullPath(localPath);
+        string extension = Path.GetExtension(path).ToLowerInvariant();
+        cancellation.ThrowIfCancellationRequested();
+        if (extension is not (".glb" or ".vrm")) return Load(path);
+        var file = new FileInfo(path);
+        if (!file.Exists || file.Length is <= 0 or > MaximumFileBytes || (file.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidDataException("请选择不超过 1 GB（1024 MB）的普通本地模型文件。");
+        var preview = await CharacterGltfImporter.LoadAsync(path, cancellation, progress);
+        return CreateGltfAsset(path, preview);
+    }
+
     public static CharacterAsset Load(string localPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(localPath);
@@ -47,21 +62,7 @@ public static class CharacterImporter
         if (extension is ".glb" or ".vrm")
         {
             var preview = CharacterGltfImporter.Load(path);
-            try
-            {
-                _ = SanitizeAndCollect(preview, clearShaders: false);
-                var actions = CharacterMotion.ActionsForImportedRig(preview);
-                return new CharacterAsset(Path.GetFileNameWithoutExtension(path),
-                    actions.Count > 1
-                        ? "已保留 VRM 人形骨骼与蒙皮，可使用应用提供的招呼、挥手、点头、鞠躬、原地步态和舞动；不播放文件动画、表情或弹簧物理。"
-                        : "GLB / VRM 网格和贴图预览；未找到完整可用的人形蒙皮绑定，暂只支持待机、转向与空间平移，不宣告骨骼动作。",
-                    preview, Array.Empty<string>(), actions);
-            }
-            catch
-            {
-                preview.Dispose();
-                throw;
-            }
+            return CreateGltfAsset(path, preview);
         }
 
         using var url = NSUrl.FromFilename(path);
@@ -134,6 +135,22 @@ public static class CharacterImporter
                 throw;
             }
         }
+    }
+
+    private static CharacterAsset CreateGltfAsset(string path, SCNNode preview)
+    {
+        try
+        {
+            _ = SanitizeAndCollect(preview, clearShaders: false);
+            var actions = CharacterMotion.ActionsForImportedRig(preview);
+            return new CharacterAsset(Path.GetFileNameWithoutExtension(path),
+                (actions.Count > 1
+                    ? "已保留 VRM 人形骨骼与蒙皮，可使用招呼、挥手、点头、鞠躬、原地步态和舞动。"
+                    : "未找到完整可用的人形蒙皮绑定，暂支持待机、转向与空间平移。") +
+                "贴图按原始分辨率加载，不自动降画质；不播放文件动画、表情或弹簧物理。",
+                preview, Array.Empty<string>(), actions);
+        }
+        catch { CharacterAsset.DisposeNode(preview); throw; }
     }
 
     private static List<string> SanitizeAndCollect(SCNNode root, bool clearShaders = true)

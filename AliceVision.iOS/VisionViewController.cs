@@ -360,9 +360,9 @@ public sealed partial class VisionViewController : UIViewController
         }
         finally
         {
-            if (!transferred) replacement.Dispose();
+            if (!transferred) CharacterAsset.DisposeNode(replacement);
         }
-        previousNode?.Dispose();
+        if (previousNode is not null) CharacterAsset.DisposeNode(previousNode);
     }
 
     private void ClearTarget()
@@ -672,6 +672,7 @@ public sealed partial class VisionViewController : UIViewController
         long epoch = Interlocked.Read(ref _sessionGeneration);
         _importCancellation = new CancellationTokenSource();
         var cancellation = _importCancellation.Token;
+        _importButton.Enabled = false;
         bool scoped = url.StartAccessingSecurityScopedResource();
         string? destination = null;
         bool accepted = false;
@@ -711,7 +712,15 @@ public sealed partial class VisionViewController : UIViewController
             if (_disposed || operation != _importGeneration || epoch != Interlocked.Read(ref _sessionGeneration))
                 throw new OperationCanceledException();
             // SceneKit node creation and attachment stay on the UIKit main thread.
-            rejectedAsset = CharacterImporter.Load(destination);
+            rejectedAsset = await CharacterImporter.LoadAsync(destination, cancellation, message =>
+            {
+                if (_disposed || operation != _importGeneration) return;
+                _placementMessage = message;
+                RefreshStatus();
+            });
+            cancellation.ThrowIfCancellationRequested();
+            if (_disposed || operation != _importGeneration || epoch != Interlocked.Read(ref _sessionGeneration))
+                throw new OperationCanceledException();
             ReplaceCharacterNode(rejectedAsset);
             var previous = _asset; _asset = rejectedAsset; rejectedAsset = null;
             accepted = true;
@@ -738,6 +747,7 @@ public sealed partial class VisionViewController : UIViewController
                 try { File.Delete(destination); } catch (IOException) { } catch (UnauthorizedAccessException) { }
             }
             if (operation == _importGeneration) { _importCancellation?.Dispose(); _importCancellation = null; }
+            if (!_disposed && _importCancellation is null) _importButton.Enabled = true;
         }
     }
 
@@ -745,6 +755,36 @@ public sealed partial class VisionViewController : UIViewController
     {
         ++_importGeneration;
         _importCancellation?.Cancel(); _importCancellation?.Dispose(); _importCancellation = null;
+        if (!_disposed) _importButton.Enabled = true;
+    }
+
+    public override void DidReceiveMemoryWarning()
+    {
+        base.DidReceiveMemoryWarning();
+        if (_disposed) return;
+        StopAutonomy("系统内存紧张，AI 已暂停。");
+        StopMotion(); CancelImport();
+        // iOS can reduce the app's headroom after a successful import. Release
+        // the high-resolution asset, never silently replace its textures with
+        // low-resolution copies. The user's source/copy remains on disk.
+        if (!_asset.IsBuiltIn)
+        {
+            if (_characterNode is not null) CharacterAsset.DisposeNode(_characterNode);
+            _characterNode = null;
+            if (_characterAnchor is not null)
+            {
+                _sceneView.Session.RemoveAnchor(_characterAnchor);
+                _characterAnchor.Dispose(); _characterAnchor = null;
+            }
+            _characterAnchorNode = null; _characterPlaneId = null;
+            ClearTarget();
+            var previous = _asset;
+            _asset = CharacterFactory.CreateDefault();
+            previous.Dispose();
+            ++_assetGeneration;
+        }
+        _placementMessage = "系统内存警告：已停止导入并卸载大模型保护内存；原文件未修改，没有降低画质。可重启应用后重试。";
+        RefreshStatus();
     }
 
     private void PresentSheet(UIAlertController sheet, UIView source)
@@ -763,6 +803,7 @@ public sealed partial class VisionViewController : UIViewController
     }
 
     private static string CharacterErrorMessage(Exception error) =>
+        error is OutOfMemoryException ? "手机内存不足，已停止原画质导入；没有缩小贴图或修改源文件。请重启应用后重试，超出设备容量的模型仍无法加载。" :
         error is InvalidOperationException or InvalidDataException or NotSupportedException ? error.Message :
         "模型暂时无法显示。推荐转换为自包含 USDZ，或换一个模型后重试。";
 

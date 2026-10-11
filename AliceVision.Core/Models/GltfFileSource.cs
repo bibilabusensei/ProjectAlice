@@ -7,12 +7,20 @@ internal abstract class GltfBinarySource
 {
     public abstract int Length { get; }
     public abstract ReadOnlySpan<byte> Slice(int offset, int length);
+    public abstract byte[] ReadBytes(int offset, int length);
+    public abstract Func<byte[]> CaptureReader(int offset, int length);
 }
 
 internal sealed class GltfMemorySource(ReadOnlyMemory<byte> bytes) : GltfBinarySource
 {
     public override int Length => bytes.Length;
     public override ReadOnlySpan<byte> Slice(int offset, int length) => bytes.Span.Slice(offset, length);
+    public override byte[] ReadBytes(int offset, int length) => bytes.Slice(offset, length).ToArray();
+    public override Func<byte[]> CaptureReader(int offset, int length)
+    {
+        _ = bytes.Slice(offset, length);
+        return () => bytes.Slice(offset, length).ToArray();
+    }
 }
 
 internal static class GltfFileSource
@@ -20,6 +28,7 @@ internal static class GltfFileSource
     public static GltfDocument Read(string path,
         Func<ReadOnlyMemory<byte>, GltfBinarySource, GltfDocument> parse)
     {
+        path = Path.GetFullPath(path);
         using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
             64 * 1024, FileOptions.RandomAccess);
         long fileLength = file.Length;
@@ -57,33 +66,80 @@ internal static class GltfFileSource
             offset += length;
         }
         if (json is null || binaryOffset < 0) throw new InvalidDataException("模型缺少嵌入几何数据。");
-        var result = parse(json, new FileBinarySource(file, binaryOffset, binaryLength));
-        if (file.Length != fileLength) throw new InvalidDataException("读取期间模型文件发生变化。");
+        var stamp = FileStamp.Read(path);
+        var result = parse(json, new FileBinarySource(file, path, stamp, binaryOffset, binaryLength));
+        if (file.Length != fileLength || FileStamp.Read(path) != stamp)
+            throw new InvalidDataException("读取期间模型文件发生变化，请重新导入。");
         return result;
     }
 
     private static uint U32(ReadOnlySpan<byte> bytes, int offset) =>
         BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(offset, 4));
 
-    private sealed class FileBinarySource(FileStream file, int start, int length) : GltfBinarySource
+    private readonly record struct FileStamp(long Length, DateTime Written, DateTime Created)
+    {
+        public static FileStamp Read(string path)
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists || (info.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException("模型源文件不可用，请重新导入。");
+            return new(info.Length, info.LastWriteTimeUtc, info.CreationTimeUtc);
+        }
+    }
+
+    private sealed class FileBinarySource(FileStream file, string path, FileStamp stamp, int start, int length) : GltfBinarySource
     {
         private const int PageSize = 64 * 1024;
         private readonly byte[] _page = new byte[PageSize + 16];
         private int _pageStart = -1, _pageCount;
         public override int Length => length;
 
-        public override ReadOnlySpan<byte> Slice(int offset, int count)
+        private void ValidateRange(int offset, int count)
         {
             if (offset < 0 || count < 0 || (long)offset + count > Length)
                 throw new InvalidDataException("模型缓冲区范围无效。");
+        }
+
+        public override byte[] ReadBytes(int offset, int count)
+        {
+            ValidateRange(offset, count);
+            byte[] result = new byte[count];
+            file.Position = (long)start + offset;
+            file.ReadExactly(result);
+            return result;
+        }
+
+        public override Func<byte[]> CaptureReader(int offset, int count)
+        {
+            ValidateRange(offset, count);
+            long absoluteOffset = (long)start + offset;
+            string sourcePath = path;
+            FileStamp expected = stamp;
+            // The document outlives the parsing stream. Capture only the exact
+            // validated range and file identity, not its handle or decoded data.
+            return () =>
+            {
+                using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 64 * 1024, FileOptions.RandomAccess);
+                if (source.Length != expected.Length || FileStamp.Read(sourcePath) != expected ||
+                    absoluteOffset < 0 || count > source.Length - absoluteOffset)
+                    throw new InvalidDataException("模型源文件已变化，请重新导入；未继续加载纹理。");
+                byte[] result = new byte[count];
+                source.Position = absoluteOffset;
+                source.ReadExactly(result);
+                if (source.Length != expected.Length || FileStamp.Read(sourcePath) != expected)
+                    throw new InvalidDataException("读取纹理期间模型源文件发生变化，请重新导入。");
+                return result;
+            };
+        }
+
+        public override ReadOnlySpan<byte> Slice(int offset, int count)
+        {
+            ValidateRange(offset, count);
             if (count == 0) return ReadOnlySpan<byte>.Empty;
             if (count > 16)
             {
-                // Image reads are independently limited by the reader's per-image/total budgets.
-                var bytes = new byte[count];
-                file.Position = (long)start + offset;
-                file.ReadExactly(bytes);
-                return bytes;
+                return ReadBytes(offset, count);
             }
             if (_pageStart < 0 || offset < _pageStart || (long)offset + count > _pageStart + _pageCount)
             {

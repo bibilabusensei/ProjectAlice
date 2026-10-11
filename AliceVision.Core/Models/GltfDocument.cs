@@ -9,7 +9,6 @@ public sealed record GltfSkinBinding(int[] Joints, Matrix4x4[] InverseBindMatric
 public sealed record GltfPrimitive(float[] Positions, float[]? Normals, float[]? Texcoords, uint[] Indices, int Material,
     GltfSkinBinding? Skin = null);
 public sealed record GltfNode(string Name, Matrix4x4 Transform, int[] Children, IReadOnlyList<GltfPrimitive> Primitives);
-public sealed record GltfImage(byte[] Bytes, string MimeType, int Width, int Height);
 public sealed record GltfTexture(int Image, int WrapS, int WrapT);
 public sealed record GltfMaterial(Vector4 BaseColor, int Texture, float Metallic, float Roughness,
     bool DoubleSided, string AlphaMode, float AlphaCutoff, bool Unlit);
@@ -25,8 +24,12 @@ public sealed class GltfDocument
     public const int MaximumVertices = 300_000;
     public const int MaximumTriangles = 500_000;
     public const int MaximumNodes = 4096;
-    public const long MaximumImagePixels = 16L * 1024 * 1024;
-    public const long MaximumTotalImagePixels = 64L * 1024 * 1024;
+    public const int MaximumImages = 64;
+    public const int MaximumImageEdge = 8192;
+    public const long MaximumImagePixels = 64L * 1024 * 1024;
+    public const int MaximumEncodedImageBytes = 64 * 1024 * 1024;
+    public const long MaximumTotalEncodedImageBytes = 512L * 1024 * 1024;
+    private const int MaximumImageHeaderBytes = 1024 * 1024;
     private GltfDocument(GltfNode[] nodes, int[] roots, GltfImage[] images, GltfTexture[] textures,
         GltfMaterial[] materials, bool hasSkin, bool hasMorphs, bool hasAnimations,
         IReadOnlyDictionary<string, int> humanBones, bool legacyVrm)
@@ -557,25 +560,29 @@ public sealed class GltfDocument
 
         private GltfImage[] ReadImages()
         {
-            var images = Array(_root, "images", 64);
+            var images = Array(_root, "images", MaximumImages);
             var result = new GltfImage[images.Length];
-            long pixelTotal = 0;
             long encodedTotal = 0;
             for (int i = 0; i < images.Length; i++)
             {
                 var view = _views[Index(images[i].GetProperty("bufferView"), _views.Length)];
                 string mime = Text(images[i], "mimeType");
-                if (view.Length > 20 * 1024 * 1024 || mime is not ("image/png" or "image/jpeg"))
-                    throw Invalid("仅支持不超过 20 MB 的嵌入 PNG / JPEG 纹理。");
+                if (view.Length > MaximumEncodedImageBytes || mime is not ("image/png" or "image/jpeg"))
+                    throw Invalid("仅支持不超过 64 MB 的嵌入 PNG / JPEG 纹理。");
                 encodedTotal = checked(encodedTotal + view.Length);
-                if (encodedTotal > 80L * 1024 * 1024) throw Invalid("模型嵌入贴图总量超过 80 MB 内存预算。");
-                byte[] bytes = _binary.Slice(view.Offset, view.Length).ToArray();
-                (int width, int height) = ImageDimensions(bytes, mime);
-                pixelTotal += (long)width * height;
-                if (width <= 0 || height <= 0 || width > 8192 || height > 8192 ||
-                    (long)width * height > MaximumImagePixels || pixelTotal > MaximumTotalImagePixels)
-                    throw Invalid("模型纹理解码尺寸超过预算。");
-                result[i] = new GltfImage(bytes, mime, width, height);
+                if (encodedTotal > MaximumTotalEncodedImageBytes)
+                    throw Invalid("模型嵌入贴图总量超过 512 MB 安全限制。");
+                // Read only a bounded metadata prefix here. Actual full-resolution
+                // decoding happens once per referenced image after device-memory
+                // preflight; no raw total-pixel cap rejects unused thumbnails.
+                int headerLength = Math.Min(view.Length, mime == "image/png" ? 33 : MaximumImageHeaderBytes);
+                byte[] header = _binary.ReadBytes(view.Offset, headerLength);
+                (int width, int height, int decodedBytesPerPixel) = ImageMetadata(header, mime);
+                if (width <= 0 || height <= 0 || width > MaximumImageEdge || height > MaximumImageEdge ||
+                    (long)width * height > MaximumImagePixels)
+                    throw Invalid($"第 {i + 1} 张纹理尺寸 {width}×{height} 超过 8192×8192 安全限制；未降低画质。");
+                result[i] = new GltfImage(view.Length, mime, width, height,
+                    _binary.CaptureReader(view.Offset, view.Length), decodedBytesPerPixel);
             }
             return result;
         }
@@ -653,7 +660,7 @@ public sealed class GltfDocument
             }
         }
 
-        private static (int Width, int Height) ImageDimensions(byte[] bytes, string mime)
+        private static (int Width, int Height, int DecodedBytesPerPixel) ImageMetadata(byte[] bytes, string mime)
         {
             if (mime == "image/png")
             {
@@ -661,8 +668,18 @@ public sealed class GltfDocument
                 if (bytes.Length < 33 || !bytes.AsSpan(0, 8).SequenceEqual(signature) ||
                     BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(8, 4)) != 13 ||
                     !bytes.AsSpan(12, 4).SequenceEqual("IHDR"u8)) throw Invalid("模型 PNG 纹理头损坏。");
+                int depth = bytes[24], color = bytes[25];
+                bool validDepth = color switch
+                {
+                    0 => depth is 1 or 2 or 4 or 8 or 16,
+                    2 or 4 or 6 => depth is 8 or 16,
+                    3 => depth is 1 or 2 or 4 or 8,
+                    _ => false
+                };
+                if (!validDepth || bytes[26] != 0 || bytes[27] != 0 || bytes[28] > 1)
+                    throw Invalid("模型 PNG 位深、颜色类型或压缩头无效。");
                 return (checked((int)BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(16, 4))),
-                    checked((int)BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(20, 4))));
+                    checked((int)BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(20, 4))), depth == 16 ? 8 : 4);
             }
             if (bytes.Length < 4 || bytes[0] != 255 || bytes[1] != 216) throw Invalid("模型 JPEG 纹理头损坏。");
             int offset = 2;
@@ -679,9 +696,10 @@ public sealed class GltfDocument
                 if (length < 2 || offset + length > bytes.Length) throw Invalid("模型 JPEG 段越界。");
                 if (marker is >= 0xc0 and <= 0xcf && marker is not (0xc4 or 0xc8 or 0xcc))
                 {
-                    if (length < 8) throw Invalid("模型 JPEG 尺寸段损坏。");
+                    if (length < 8 || bytes[offset + 2] is < 1 or > 16 || bytes[offset + 7] is < 1 or > 4)
+                        throw Invalid("模型 JPEG 尺寸段损坏。");
                     return (BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset + 5, 2)),
-                        BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset + 3, 2)));
+                        BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset + 3, 2)), bytes[offset + 2] > 8 ? 8 : 4);
                 }
                 offset += length;
             }

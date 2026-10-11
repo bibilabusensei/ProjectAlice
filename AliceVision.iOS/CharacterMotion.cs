@@ -184,6 +184,12 @@ public static class CharacterMotion
         return found;
     }
 
+    internal static void Forget(SCNNode root)
+    {
+        Stop(root);
+        States.Remove(root);
+    }
+
     public static void Stop(SCNNode root)
     {
         if (States.TryGetValue(root, out var state))

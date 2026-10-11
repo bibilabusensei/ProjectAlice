@@ -3,6 +3,7 @@ using System.Numerics;
 using AliceVision.Core.Models;
 using CoreGraphics;
 using Foundation;
+using ImageIO;
 using SceneKit;
 using UIKit;
 
@@ -17,13 +18,21 @@ internal static class CharacterGltfImporter
 {
     internal const string RigRoot = "AliceVision.GLBRig";
     internal const string BonePrefix = "AliceVision.Humanoid.";
-    public const int MaximumPreviewTextureEdge = 1024;
+    public static SCNNode Load(string localPath) =>
+        LoadAsync(localPath, CancellationToken.None, null, yieldBetweenSteps: false).GetAwaiter().GetResult();
 
-    public static SCNNode Load(string localPath)
+    public static async Task<SCNNode> LoadAsync(string localPath, CancellationToken cancellation,
+        Action<string>? progress = null, bool yieldBetweenSteps = true)
     {
-        GltfDocument document = GltfDocument.Load(localPath);
+        cancellation.ThrowIfCancellationRequested();
+        ModelMemoryGuard.EnsureCanAllocate(128L * 1024 * 1024, "解析模型前检查");
+        progress?.Invoke("正在解析模型；保留原始贴图分辨率…");
+        GltfDocument document = yieldBetweenSteps
+            ? await Task.Run(() => GltfDocument.Load(localPath), cancellation)
+            : GltfDocument.Load(localPath);
+        cancellation.ThrowIfCancellationRequested();
         var root = new SCNNode { Name = RigRoot };
-        var content = new SCNNode { Name = "AliceVision.AvatarCoordinates", Transform = ToSceneMatrix(document.AvatarBasis) };
+        using var content = new SCNNode { Name = "AliceVision.AvatarCoordinates", Transform = ToSceneMatrix(document.AvatarBasis) };
         root.AddChildNode(content);
         var selectedNodes = new HashSet<int>();
         var pendingNodes = new Stack<int>(document.Roots);
@@ -36,37 +45,35 @@ internal static class CharacterGltfImporter
             .Select(primitive => primitive.Material).Where(index => index >= 0).ToHashSet();
         var decodedImages = new UIImage?[document.Images.Count];
         var nativeMaterials = new SCNMaterial?[document.Materials.Count];
+        var nodes = new SCNNode[document.Nodes.Count];
         try
         {
             var referencedImages = selectedMaterials.Select(index => document.Materials[index]).Where(material => material.Texture >= 0)
                 .Select(material => document.Textures[material.Texture].Image).ToHashSet();
+            var activeImages = referencedImages.Select(index => document.Images[index]).ToArray();
+            long remainingBudget = ModelTextureMemory.Estimate(activeImages);
+            ModelMemoryGuard.EnsureCanAllocate(remainingBudget, "原画质贴图预检查");
+            int loadedCount = 0;
             for (int imageIndex = 0; imageIndex < document.Images.Count; imageIndex++)
             {
                 // VRM thumbnails and images for unsupported secondary material
                 // properties are not uploaded when no displayed material uses them.
                 if (!referencedImages.Contains(imageIndex)) continue;
                 GltfImage image = document.Images[imageIndex];
-                using var data = NSData.FromArray(image.Bytes);
-                UIImage decoded = UIImage.LoadFromData(data) ?? throw new InvalidDataException("模型 PNG / JPEG 纹理无法解码。");
-                try
-                {
-                    using var bitmap = decoded.CGImage;
-                    if (bitmap is null || bitmap.Width != image.Width || bitmap.Height != image.Height)
-                        throw new InvalidDataException("模型纹理尺寸与解码结果不匹配。");
-                    UIImage preview = CreateTexturePreview(decoded, image.Width, image.Height);
-                    if (!ReferenceEquals(preview, decoded))
-                    {
-                        decoded.Dispose();
-                        decoded = preview;
-                    }
-                    decodedImages[imageIndex] = decoded;
-                }
-                catch
-                {
-                    decoded.Dispose();
-                    throw;
-                }
+                progress?.Invoke($"原画质贴图 {loadedCount + 1}/{activeImages.Length} · {image.Width} × {image.Height}");
+                if (yieldBetweenSteps) await Task.Delay(1, cancellation);
+                cancellation.ThrowIfCancellationRequested();
+                ModelMemoryGuard.EnsureCanAllocate(remainingBudget, $"加载第 {loadedCount + 1} 张贴图前检查");
+                // One encoded image at a time; the pool and ImageIO source/cache
+                // are released before the next. No thumbnail, resize or recompress.
+                using (var pool = new NSAutoreleasePool())
+                    decodedImages[imageIndex] = DecodeOriginalImage(image);
+                remainingBudget -= ModelTextureMemory.DecodedBytes(image);
+                loadedCount++;
             }
+            cancellation.ThrowIfCancellationRequested();
+            ModelMemoryGuard.EnsureCanAllocate(remainingBudget, "构建原画质场景前检查");
+            progress?.Invoke("正在绑定骨骼与原画质材质…");
             foreach (int index in selectedMaterials)
                 nativeMaterials[index] = CreateMaterial(document.Materials[index], document, decodedImages);
             using var defaultMaterial = new SCNMaterial
@@ -78,7 +85,6 @@ internal static class CharacterGltfImporter
             defaultMaterial.Metalness.Contents = new NSNumber(1.0f);
             defaultMaterial.Roughness.Contents = new NSNumber(1.0f);
 
-            var nodes = new SCNNode[document.Nodes.Count];
             for (int i = 0; i < nodes.Length; i++)
             {
                 GltfNode source = document.Nodes[i];
@@ -90,11 +96,13 @@ internal static class CharacterGltfImporter
             {
                 GltfNode source = document.Nodes[i];
                 if (!selectedNodes.Contains(i)) continue;
+                if (yieldBetweenSteps && i % 16 == 0) await Task.Delay(1, cancellation);
+                cancellation.ThrowIfCancellationRequested();
                 foreach (GltfPrimitive primitive in source.Primitives)
                 {
                     using var geometry = CreateGeometry(primitive);
                     geometry.Materials = new[] { primitive.Material < 0 ? defaultMaterial : nativeMaterials[primitive.Material]! };
-                    var mesh = SCNNode.FromGeometry(geometry);
+                    using var mesh = SCNNode.FromGeometry(geometry);
                     if (primitive.Skin is { } binding)
                     {
                         using var weights = CreateSource(binding.Weights, 4, SCNGeometrySourceSemantics.BoneWeights);
@@ -124,46 +132,39 @@ internal static class CharacterGltfImporter
             for (int i = 0; i < nodes.Length; i++)
                 foreach (int child in document.Nodes[i].Children) nodes[i].AddChildNode(nodes[child]);
             foreach (int index in document.Roots) content.AddChildNode(nodes[index]);
+            cancellation.ThrowIfCancellationRequested();
+            ModelMemoryGuard.EnsureCanAllocate(ModelMemoryGuard.PendingTextureUploadBytes(activeImages) + 32L * 1024 * 1024,
+                "原画质 GPU 上传前检查");
             // SceneKit retains child nodes, geometries, materials and image contents.
-            foreach (SCNNode node in nodes) node.Dispose();
             return root;
         }
         catch
         {
-            root.Dispose();
+            CharacterAsset.DisposeNode(root);
             throw;
         }
         finally
         {
+            foreach (var node in nodes) node?.Dispose();
             foreach (var material in nativeMaterials) material?.Dispose();
             foreach (var image in decodedImages) image?.Dispose();
         }
     }
 
-    private static UIImage CreateTexturePreview(UIImage source, int width, int height)
+    private static UIImage DecodeOriginalImage(GltfImage image)
     {
-        int longestEdge = Math.Max(width, height);
-        if (longestEdge <= MaximumPreviewTextureEdge) return source;
-        double scale = MaximumPreviewTextureEdge / (double)longestEdge;
-        int targetWidth = Math.Max(1, (int)Math.Round(width * scale));
-        int targetHeight = Math.Max(1, (int)Math.Round(height * scale));
-        using var format = new UIGraphicsImageRendererFormat
-        {
-            Scale = 1,
-            Opaque = false,
-            PreferredRange = UIGraphicsImageRendererFormatRange.Standard
-        };
-        using var renderer = new UIGraphicsImageRenderer(new CGSize(targetWidth, targetHeight), format);
-        // Preserve the image aspect and alpha, and use physical pixels rather than
-        // the device's 3x display scale. SceneKit only retains this smaller image.
-        UIImage preview = renderer.CreateImage(_ => source.Draw(new CGRect(0, 0, targetWidth, targetHeight)));
-        using var result = preview.CGImage;
-        if (result is null || result.Width != targetWidth || result.Height != targetHeight)
-        {
-            preview.Dispose();
-            throw new InvalidDataException("模型纹理缩小失败。");
-        }
-        return preview;
+        using var data = NSData.FromArray(image.ReadEncodedBytes());
+        using var source = CGImageSource.FromData(data, new CGImageOptions { ShouldCache = false })
+            ?? throw new InvalidDataException("模型 PNG / JPEG 纹理无法读取。");
+        var properties = source.GetProperties(0, new CGImageOptions { ShouldCache = false });
+        if (source.ImageCount != 1 || properties is null || properties.PixelWidth != image.Width || properties.PixelHeight != image.Height)
+            throw new InvalidDataException("模型纹理尺寸与原始文件不匹配，或包含多帧图像。");
+        using var bitmap = source.CreateImage(0, new CGImageOptions { ShouldCache = true, ShouldCacheImmediately = true })
+            ?? throw new InvalidDataException("模型 PNG / JPEG 纹理无法解码。");
+        if (bitmap.Width != image.Width || bitmap.Height != image.Height ||
+            bitmap.BitsPerPixel > image.EstimatedDecodedBytesPerPixel * 8)
+            throw new InvalidDataException("模型原画质纹理尺寸或像素格式不受支持。");
+        return UIImage.FromImage(bitmap);
     }
 
     private static SCNGeometry CreateGeometry(GltfPrimitive primitive)
