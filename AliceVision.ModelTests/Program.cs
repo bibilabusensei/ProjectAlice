@@ -71,6 +71,10 @@ var tests = new (string Name, Action Body)[]
     ("rejects files beyond 1 GiB before allocation", RejectsOversizedFile),
     ("streams component ranges across page boundaries", StreamsPageBoundary),
     ("loads embedded PNG and PBR material metadata", LoadsPngMaterial),
+    ("preserves glTF emissive factor texture strength and zero defaults", PreservesEmission),
+    ("rejects invalid emissive factors strengths and texture references", BoundsEmission),
+    ("validates emissive texture coordinates and identity transforms", ValidatesEmissionTexture),
+    ("accounts for unique emission-only images before lazy texture decoding", AccountsEmissionImages),
     ("accepts exporter identity texture transform but rejects actual transforms", IdentityTextureTransform),
     ("reports ignored morphs and animations", ReportsStaticPreview),
     ("rejects header version length and chunk corruption", RejectsHeaderCorruption),
@@ -399,6 +403,88 @@ static void LoadsPngMaterial()
     Assert(result.Materials[0].BaseColor == new Vector4(0.5f, 0.75f, 1, 1) && result.Materials[0].AlphaMode == "MASK",
         "Material metadata changed.");
     Assert(result.Textures[0].WrapS == 33071, "Sampler wrap lost.");
+}
+
+static void PreservesEmission()
+{
+    var (json, binary) = TexturedTriangle();
+    GltfMaterial original = GltfDocument.Parse(Encode(json, binary)).Materials[0];
+    Assert(original.EmissiveFactor == Vector3.Zero && original.EmissiveTexture == -1 &&
+        original.EmissiveStrength == 1 && !original.HasEmission, "Omitted emission must remain off.");
+    json["materials"]![0]!["emissiveFactor"] = JsonNode.Parse("[0.25,0.5,1]");
+    json["materials"]![0]!["emissiveTexture"] = JsonNode.Parse("{\"index\":0}");
+    json["materials"]![0]!["extensions"] = JsonNode.Parse("{\"KHR_materials_emissive_strength\":{\"emissiveStrength\":3.5}}");
+    json["extensionsRequired"] = JsonNode.Parse("[\"KHR_materials_emissive_strength\"]");
+    GltfMaterial result = GltfDocument.Parse(Encode(json, binary)).Materials[0];
+    Assert(result.EmissiveFactor == new Vector3(0.25f, 0.5f, 1) && result.EmissiveTexture == 0 &&
+        result.EmissiveStrength == 3.5f && result.HasEmission, "Authored emission metadata was changed or clamped.");
+    json["materials"]![0]!["extensions"]!["KHR_materials_emissive_strength"]!["emissiveStrength"] = 0;
+    Assert(!GltfDocument.Parse(Encode(json, binary)).Materials[0].HasEmission, "Zero strength must disable emission.");
+}
+
+static void BoundsEmission()
+{
+    foreach (string invalid in new[] { "[-0.1,0,0]", "[0,1.1,0]", "[1,1]", "[0,0,1e100]" })
+    {
+        var (json, binary) = TexturedTriangle();
+        json["materials"]![0]!["emissiveFactor"] = JsonNode.Parse(invalid);
+        Reject(Encode(json, binary));
+    }
+    foreach (string invalid in new[] { "-1", "1e100", "\"unexpected\"" })
+    {
+        var (json, binary) = TexturedTriangle();
+        json["materials"]![0]!["extensions"] = JsonNode.Parse("{\"KHR_materials_emissive_strength\":{\"emissiveStrength\":" + invalid + "}}");
+        Reject(Encode(json, binary));
+    }
+    foreach (int invalid in new[] { -1, 1, int.MaxValue })
+    {
+        var (json, binary) = TexturedTriangle();
+        json["materials"]![0]!["emissiveTexture"] = JsonNode.Parse("{\"index\":" + invalid + "}");
+        Reject(Encode(json, binary));
+    }
+}
+
+static void ValidatesEmissionTexture()
+{
+    var (json, binary) = TexturedTriangle();
+    json["materials"]![0]!["emissiveFactor"] = JsonNode.Parse("[1,1,1]");
+    json["materials"]![0]!["emissiveTexture"] = JsonNode.Parse("{\"index\":0,\"texCoord\":0,\"extensions\":{\"KHR_texture_transform\":{\"offset\":[0,0],\"scale\":[1,1]}}}");
+    Assert(GltfDocument.Parse(Encode(json, binary)).Materials[0].HasEmission, "Identity emissive transform rejected.");
+    json["materials"]![0]!["emissiveTexture"]!["texCoord"] = 1;
+    Reject(Encode(json, binary));
+    json["materials"]![0]!["emissiveTexture"]!["texCoord"] = 0;
+    json["materials"]![0]!["emissiveTexture"]!["extensions"]!["KHR_texture_transform"]!["scale"] = JsonNode.Parse("[2,1]");
+    Reject(Encode(json, binary));
+}
+
+static void AccountsEmissionImages()
+{
+    var (json, binary) = TexturedTriangle();
+    json["images"]!.AsArray().Add(json["images"]![0]!.DeepClone());
+    json["images"]!.AsArray().Add(json["images"]![0]!.DeepClone()); // Unused thumbnail.
+    json["textures"]!.AsArray().Add(JsonNode.Parse("{\"source\":1}"));
+    json["textures"]!.AsArray().Add(JsonNode.Parse("{\"source\":0}")); // Alias, not another upload.
+    json["materials"]![0]!["emissiveFactor"] = JsonNode.Parse("[1,1,1]");
+    json["materials"]![0]!["emissiveTexture"] = JsonNode.Parse("{\"index\":1}");
+    var document = GltfDocument.Parse(Encode(json, binary));
+    var referenced = document.ReferencedImageIndices(new[] { 0, 0 });
+    Assert(referenced.SetEquals(new[] { 0, 1 }), "Emission-only pixels were not admitted exactly once.");
+    long selected = ModelTextureMemory.Estimate(referenced.Select(index => document.Images[index]));
+    Assert(selected > ModelTextureMemory.Estimate(new[] { document.Images[0] }) &&
+        selected < ModelTextureMemory.Estimate(document.Images), "Emission texture bypassed or inflated memory admission.");
+    Assert(document.Images[1].ReadEncodedBytes().SequenceEqual(document.Images[0].ReadEncodedBytes()),
+        "Emission texture original bytes changed.");
+    json["materials"]![0]!["emissiveTexture"]!["index"] = 2;
+    Assert(GltfDocument.Parse(Encode(json, binary)).ReferencedImageIndices(new[] { 0 }).SetEquals(new[] { 0 }),
+        "Shared diffuse/emission image was uploaded twice.");
+    json["materials"]![0]!["emissiveTexture"]!["index"] = 1;
+    json["materials"]![0]!["emissiveFactor"] = JsonNode.Parse("[0,0,0]");
+    Assert(GltfDocument.Parse(Encode(json, binary)).ReferencedImageIndices(new[] { 0 }).SetEquals(new[] { 0 }),
+        "Invisible emission texture entered decode budget.");
+    json["materials"]![0]!["emissiveFactor"] = JsonNode.Parse("[1,1,1]");
+    json["materials"]![0]!["extensions"] = JsonNode.Parse("{\"KHR_materials_unlit\":{}}");
+    Assert(GltfDocument.Parse(Encode(json, binary)).ReferencedImageIndices(new[] { 0 }).SetEquals(new[] { 0 }),
+        "Unlit material must not apply emission.");
 }
 
 static void ReportsStaticPreview()

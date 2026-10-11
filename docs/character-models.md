@@ -23,6 +23,18 @@ VRM0 的 -Z 前向与 VRM1 的 +Z 前向在渲染时统一为 +Z，网格和骨�
 UV 行为对照 [glTF 规范](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#images)及 [SceneKit glTF 加载器](https://github.com/magicien/GLTFSceneKit/blob/master/Sources/GLTFSceneKit/GLTFUnarchiver.swift)。
 这是程序化动作，不是动作捕捉、复杂动作生成或完整 IK，效果取决于骨骼布局和权重。请用你自己准备的模型测试。
 
+## 材质诊断与无损副本修正
+
+从 0.2.4 起，GLB / VRM 同时支持基础颜色和发光颜色 / 发光贴图；发光贴图也计入原画质内存保护。
+基础颜色乘数不再同时染色发光通道。通用支持不等于完整 MToon 或第三方自定义着色器还原。
+应用遵守模型的 `alphaMode`：没有写时按 glTF 默认 `OPAQUE` 处理，不因为 PNG 有透明像素就自动把全部材质改成透明。
+参见 [glTF 材质规范](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#materials)。
+
+若确认模型错误地把阴影遮罩接到了 `baseColorTexture`，或透明眼睛 / 高光层漏写了 `BLEND`，
+应只修改对应材质字段并另存副本，不改几何、骨骼、UV 或图片像素。仓库提供 `scripts/repair-vrm-materials.py`，
+必须指定经过检查的本地修正计划；工具不会自动猜测材质，默认拒绝覆盖文件，并验证原文件和二进制块不变。
+私有修正计划和模型放在被 Git 忽略的 `private-models/` 中，不发布到公开仓库。
+
 ## 文件限制与内存保护
 
 文件上限与渲染能力不同。GLB/VRM 按需读取引用数据，不一次性载入 1 GB；从 0.2.2 起保留 200 万顶点、400 万三角形、4096 节点等格式安全边界。

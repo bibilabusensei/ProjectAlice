@@ -44,6 +44,8 @@ jobs:
         run: dotnet run --project AliceVision.AgentTests/AliceVision.AgentTests.csproj --configuration Release
       - name: Test IPA publication guards
         run: python3 scripts/test-verify-ipa.py
+      - name: Test lossless material-copy repair guards
+        run: python3 scripts/test-repair-vrm-materials.py
 
   build-iphone:
     name: Build and inspect physical iPhone app

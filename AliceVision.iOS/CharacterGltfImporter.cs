@@ -50,8 +50,7 @@ internal static class CharacterGltfImporter
         var nodes = new SCNNode[document.Nodes.Count];
         try
         {
-            var referencedImages = selectedMaterials.Select(index => document.Materials[index]).Where(material => material.Texture >= 0)
-                .Select(material => document.Textures[material.Texture].Image).ToHashSet();
+            var referencedImages = document.ReferencedImageIndices(selectedMaterials);
             var activeImages = referencedImages.Select(index => document.Images[index]).ToArray();
             // Managed geometry is now allocated, but native CPU/GPU copies are
             // still pending. Keep their full cost in the texture admission check.
@@ -233,20 +232,49 @@ internal static class CharacterGltfImporter
         material.Metalness.Contents = new NSNumber(source.Metallic);
         material.Roughness.Contents = new NSNumber(source.Roughness);
         var color = UIColor.FromRGBA(source.BaseColor.X, source.BaseColor.Y, source.BaseColor.Z, 1.0f);
+        var surface = new List<string>();
         if (source.Texture >= 0)
         {
             GltfTexture texture = document.Textures[source.Texture];
             material.Diffuse.Contents = images[texture.Image] ?? throw new InvalidDataException("模型纹理未加载。");
-            material.Multiply.Contents = color;
-            material.Diffuse.WrapS = Wrap(texture.WrapS);
-            material.Diffuse.WrapT = Wrap(texture.WrapT);
-            material.Diffuse.MinificationFilter = SCNFilterMode.Linear;
-            material.Diffuse.MagnificationFilter = SCNFilterMode.Linear;
-            material.Diffuse.MipFilter = SCNFilterMode.Linear;
+            ApplySampler(material.Diffuse, texture);
+            // A material-wide Multiply also tints emission. glTF factors apply
+            // to their individual channels, so only change sampled diffuse RGB.
+            var baseFactor = new Vector3(source.BaseColor.X, source.BaseColor.Y, source.BaseColor.Z);
+            if (baseFactor != Vector3.One)
+                surface.Add("_surface.diffuse.rgb *= " + ShaderColor(baseFactor) + ";");
         }
         else material.Diffuse.Contents = color;
+        if (source.HasEmission)
+        {
+            if (source.EmissiveTexture >= 0)
+            {
+                GltfTexture texture = document.Textures[source.EmissiveTexture];
+                material.Emission.Contents = images[texture.Image] ?? throw new InvalidDataException("模型自发光纹理未加载。");
+                ApplySampler(material.Emission, texture);
+            }
+            else material.Emission.Contents = UIColor.White;
+            // glTF factors are linear multipliers. MaterialProperty.Intensity is
+            // documented only for 0..1; apply HDR strengths here without clipping.
+            surface.Add("_surface.emission.rgb *= " + ShaderColor(source.EmissiveFactor) + " * " +
+                source.EmissiveStrength.ToString("R", CultureInfo.InvariantCulture) + ";");
+            // glTF emission uses RGB only, independent of texture alpha.
+            surface.Add("_surface.emission.a = 1.0;");
+        }
         material.Transparency = source.AlphaMode == "OPAQUE" ? 1.0f : source.BaseColor.W;
-        // These fixed app-authored shader snippets only implement the glTF alpha mode.
+        var modifiers = new SCNShaderModifiers();
+        bool blended = source.AlphaMode == "BLEND";
+        if (surface.Count > 0 || blended)
+        {
+            // SceneKit must classify an authored BLEND surface as transparent,
+            // even when the sampled RGB needs no custom multiplier. The diffuse
+            // image already provides coverage; do not also assign it to the
+            // Transparent channel and multiply that coverage a second time.
+            modifiers.EntryPointSurface = (blended ? "#pragma transparent\n" : string.Empty) +
+                "#pragma body\n" + string.Join("\n", surface);
+        }
+        // These fixed app-authored snippets implement validated material factors
+        // and glTF alpha modes. Numbers use invariant formatting, never model code.
         // No shader strings from the model are accepted or executed.
         if (source.AlphaMode is "MASK" or "OPAQUE")
         {
@@ -254,9 +282,24 @@ internal static class CharacterGltfImporter
                 ? "#pragma body\nif (_output.color.a < " + source.AlphaCutoff.ToString("0.000000", CultureInfo.InvariantCulture) +
                   ") { discard_fragment(); }\n_output.color.a = 1.0;"
                 : "#pragma body\n_output.color.a = 1.0;";
-            material.ShaderModifiers = new SCNShaderModifiers { EntryPointFragment = fragment };
+            modifiers.EntryPointFragment = fragment;
         }
+        if (surface.Count > 0 || blended || source.AlphaMode is "MASK" or "OPAQUE") material.ShaderModifiers = modifiers;
         return material;
+    }
+
+    private static string ShaderColor(Vector3 factor) => "float3(" +
+        factor.X.ToString("R", CultureInfo.InvariantCulture) + "," +
+        factor.Y.ToString("R", CultureInfo.InvariantCulture) + "," +
+        factor.Z.ToString("R", CultureInfo.InvariantCulture) + ")";
+
+    private static void ApplySampler(SCNMaterialProperty property, GltfTexture texture)
+    {
+        property.WrapS = Wrap(texture.WrapS);
+        property.WrapT = Wrap(texture.WrapT);
+        property.MinificationFilter = SCNFilterMode.Linear;
+        property.MagnificationFilter = SCNFilterMode.Linear;
+        property.MipFilter = SCNFilterMode.Linear;
     }
 
     private static SCNWrapMode Wrap(int wrap) => wrap switch

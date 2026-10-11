@@ -12,7 +12,18 @@ public sealed record GltfPrimitive(float[] Positions, float[]? Normals, float[]?
 public sealed record GltfNode(string Name, Matrix4x4 Transform, int[] Children, IReadOnlyList<GltfPrimitive> Primitives);
 public sealed record GltfTexture(int Image, int WrapS, int WrapT);
 public sealed record GltfMaterial(Vector4 BaseColor, int Texture, float Metallic, float Roughness,
-    bool DoubleSided, string AlphaMode, float AlphaCutoff, bool Unlit);
+    bool DoubleSided, string AlphaMode, float AlphaCutoff, bool Unlit,
+    Vector3 EmissiveFactor = default, int EmissiveTexture = -1, float EmissiveStrength = 1)
+{
+    // KHR_materials_unlit ignores lighting and emission. An authored zero
+    // factor/strength cannot contribute pixels and needs no additional decode.
+    public bool HasEmission => !Unlit && EmissiveStrength > 0 && EmissiveFactor != Vector3.Zero;
+    public IEnumerable<int> ReferencedTextures()
+    {
+        if (Texture >= 0) yield return Texture;
+        if (HasEmission && EmissiveTexture >= 0 && EmissiveTexture != Texture) yield return EmissiveTexture;
+    }
+}
 
 /// <summary>
 /// Conservative, self-contained GLB 2.0 reader. It never resolves URIs or runs code.
@@ -49,6 +60,20 @@ public sealed class GltfDocument
     public IReadOnlyList<GltfImage> Images { get; }
     public IReadOnlyList<GltfTexture> Textures { get; }
     public IReadOnlyList<GltfMaterial> Materials { get; }
+    /// <summary>Unique displayed image references, used by native admission before decoding.</summary>
+    public IReadOnlySet<int> ReferencedImageIndices(IEnumerable<int> materialIndices)
+    {
+        ArgumentNullException.ThrowIfNull(materialIndices);
+        var result = new HashSet<int>();
+        foreach (int materialIndex in materialIndices)
+        {
+            if (materialIndex < 0 || materialIndex >= Materials.Count)
+                throw new InvalidDataException("模型材质引用无效。");
+            foreach (int textureIndex in Materials[materialIndex].ReferencedTextures())
+                result.Add(Textures[textureIndex].Image);
+        }
+        return result;
+    }
     public bool HasSkin { get; }
     public bool HasMorphs { get; }
     public bool HasAnimations { get; }
@@ -159,7 +184,7 @@ public sealed class GltfDocument
             {
                 string name = extension.GetString() ?? "";
                 if (name is not ("VRM" or "VRMC_vrm" or "VRMC_materials_mtoon" or "VRMC_springBone" or
-                    "VRMC_node_constraint" or "KHR_materials_unlit" or "KHR_texture_transform"))
+                    "VRMC_node_constraint" or "KHR_materials_unlit" or "KHR_texture_transform" or "KHR_materials_emissive_strength"))
                     throw Invalid("模型需要尚未支持的压缩、材质或几何扩展。");
             }
             var buffers = Array(_root, "buffers", 1);
@@ -711,21 +736,42 @@ public sealed class GltfDocument
                     }
                     metallic = UnitFloat(pbr, "metallicFactor", 1); roughness = UnitFloat(pbr, "roughnessFactor", 1);
                     if (pbr.TryGetProperty("baseColorTexture", out var textureValue))
-                    {
-                        texture = Index(textureValue.GetProperty("index"), textureCount);
-                        if (Integer(textureValue, "texCoord", 0) != 0)
-                            throw Invalid("暂不支持非零纹理坐标集。");
-                        ValidateIdentityTextureTransform(textureValue);
-                    }
+                        texture = ReadMaterialTexture(textureValue, textureCount);
                 }
                 string alpha = Text(material, "alphaMode", "OPAQUE");
                 if (alpha is not ("OPAQUE" or "MASK" or "BLEND")) throw Invalid("模型透明模式无效。");
                 bool unlit = material.TryGetProperty("extensions", out var extensions) &&
                     (extensions.TryGetProperty("KHR_materials_unlit", out _) || extensions.TryGetProperty("VRMC_materials_mtoon", out _));
+                Vector3 emissiveFactor = Vector3.Zero;
+                if (material.TryGetProperty("emissiveFactor", out var emissiveValue))
+                {
+                    float[] values = ReadFloats(emissiveValue, 3);
+                    if (values.Any(value => value is < 0 or > 1)) throw Invalid("模型自发光颜色分量必须在 0 到 1 之间。");
+                    emissiveFactor = new Vector3(values[0], values[1], values[2]);
+                }
+                int emissiveTexture = material.TryGetProperty("emissiveTexture", out var emissiveTextureValue)
+                    ? ReadMaterialTexture(emissiveTextureValue, textureCount) : -1;
+                float emissiveStrength = 1;
+                if (extensions.ValueKind == JsonValueKind.Object &&
+                    extensions.TryGetProperty("KHR_materials_emissive_strength", out var strengthExtension))
+                {
+                    emissiveStrength = strengthExtension.TryGetProperty("emissiveStrength", out var strengthValue)
+                        ? strengthValue.GetSingle() : 1;
+                    if (!float.IsFinite(emissiveStrength) || emissiveStrength < 0)
+                        throw Invalid("模型自发光强度必须是有限非负数。");
+                }
                 result[i] = new GltfMaterial(color, texture, metallic, roughness, Boolean(material, "doubleSided", false),
-                    alpha, UnitFloat(material, "alphaCutoff", 0.5f), unlit);
+                    alpha, UnitFloat(material, "alphaCutoff", 0.5f), unlit, emissiveFactor, emissiveTexture, emissiveStrength);
             }
             return result;
+        }
+
+        private int ReadMaterialTexture(JsonElement value, int textureCount)
+        {
+            int texture = Index(value.GetProperty("index"), textureCount);
+            if (Integer(value, "texCoord", 0) != 0) throw Invalid("暂不支持非零纹理坐标集。");
+            ValidateIdentityTextureTransform(value);
+            return texture;
         }
 
         private static void ValidateIdentityTextureTransform(JsonElement texture)
